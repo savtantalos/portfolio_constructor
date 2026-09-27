@@ -1,0 +1,39 @@
+[project]
+name = "portfolio-backend"
+version = "0.1.0"
+description = "Portfolio optimization, allocation simulation, and walk-forward backtesting API"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.12",
+    "numpy==2.2.6",
+    "pandas==2.2.3",
+    "psycopg[binary]==3.2.9",
+    "pydantic==2.11.7",
+    "pydantic-settings==2.10.1",
+    "scikit-learn==1.6.1",
+    "scipy==1.15.3",
+    "sqlalchemy==2.0.41",
+    "uvicorn==0.34.3",
+    "yfinance==0.2.65",
+]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "pytest==8.4.1",
+    "ruff==0.12.1",
+]
+
+[tool.uv]
+exclude-newer = "2026-09-01T00:00:00Z"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

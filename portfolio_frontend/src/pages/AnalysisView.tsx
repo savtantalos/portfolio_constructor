@@ -47,7 +47,7 @@ export default function AnalysisView({ theme, themeName, themeNames, setTheme }:
     { key: 'overview' as const, label: 'Overview' },
     { key: 'frontier' as const, label: 'Frontier & Monte Carlo' },
     ...(results.backtests.length > 0 ? [{ key: 'backtest' as const, label: 'Backtesting' }] : []),
-    ...(prices ? [{ key: 'prices' as const, label: 'Price Data' }] : []),
+    ...(prices ? [{ key: 'prices' as const, label: 'Returns & Volatility' }] : []),
     ...(results.warnings.length > 0 ? [{ key: 'warnings' as const, label: `Warnings (${results.warnings.length})` }] : []),
   ];
 
@@ -61,7 +61,10 @@ export default function AnalysisView({ theme, themeName, themeNames, setTheme }:
             {data.effective_start} to {data.effective_end} &middot; {data.price_observations} observations &middot; v{analysis.engine_version}
           </p>
         </div>
-        <ThemePicker current={themeName} themes={themeNames} onChange={setTheme} theme={theme} />
+        <div className="page-actions">
+          <Link to={`/analysis/${analysis.id}/edit`} className="submit-btn action-link">Edit &amp; rerun</Link>
+          <ThemePicker current={themeName} themes={themeNames} onChange={setTheme} theme={theme} />
+        </div>
       </div>
 
       <div className="tab-bar">
@@ -111,7 +114,7 @@ export default function AnalysisView({ theme, themeName, themeNames, setTheme }:
 
       {activeTab === 'prices' && prices && (
         <div className="tab-content">
-          <PriceChart snapshot={prices} theme={theme} />
+          <PriceChart snapshot={prices} theme={theme} currency={data.currency} />
           <div className="data-summary">
             <h3>Data Summary</h3>
             <div className="config-grid">

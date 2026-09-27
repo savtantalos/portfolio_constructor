@@ -90,6 +90,14 @@ body {
 .page-subtitle { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
 .back-link { color: var(--accent); text-decoration: none; font-size: 0.85rem; display: inline-block; margin-bottom: 0.5rem; }
 .back-link:hover { text-decoration: underline; }
+.page-actions { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 1rem; }
+.submit-btn.action-link { display: inline-block; width: auto; text-decoration: none; text-align: center; }
+.asset-charts { min-width: 0; }
+.asset-chart-section { margin-bottom: 1.5rem; }
+.chart-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 1rem; margin-bottom: 0.6rem; }
+.chart-controls .form-label { margin-bottom: 0; }
+.chart-controls .form-input { width: auto; max-width: 100%; }
+.chart-description { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1rem; }
 
 /* ========== Alerts ========== */
 .alert { padding: 0.8rem 1rem; border-radius: var(--radius); margin-bottom: 1rem; font-size: 0.85rem; }

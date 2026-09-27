@@ -5,6 +5,7 @@ import TickerSearch from './TickerSearch';
 interface Props {
   onSubmit: (request: AnalysisRequest) => void;
   loading: boolean;
+  initialRequest?: AnalysisRequest;
 }
 
 const ALL_STRATEGIES: { value: Strategy; label: string }[] = [
@@ -17,24 +18,24 @@ function formatDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-export default function AnalysisForm({ onSubmit, loading }: Props) {
+export default function AnalysisForm({ onSubmit, loading, initialRequest }: Props) {
   const today = new Date();
   const twoYearsAgo = new Date(today);
   twoYearsAgo.setFullYear(today.getFullYear() - 2);
 
-  const [tickers, setTickers] = useState<string[]>([]);
-  const [startDate, setStartDate] = useState(formatDate(twoYearsAgo));
-  const [endDate, setEndDate] = useState(formatDate(today));
-  const [strategies, setStrategies] = useState<Strategy[]>(['equal_weight', 'minimum_variance', 'maximum_sharpe']);
-  const [minWeight, setMinWeight] = useState(0);
-  const [maxWeight, setMaxWeight] = useState(1);
-  const [riskFreeRate, setRiskFreeRate] = useState(0.02);
-  const [monteCarloSamples, setMonteCarloSamples] = useState(1000);
-  const [frontierPoints, setFrontierPoints] = useState(20);
-  const [backtestEnabled, setBacktestEnabled] = useState(true);
-  const [lookbackDays, setLookbackDays] = useState(252);
-  const [rebalanceEvery, setRebalanceEvery] = useState(21);
-  const [transactionCostBps, setTransactionCostBps] = useState(10);
+  const [tickers, setTickers] = useState<string[]>(initialRequest?.tickers ?? []);
+  const [startDate, setStartDate] = useState(initialRequest?.start_date ?? formatDate(twoYearsAgo));
+  const [endDate, setEndDate] = useState(initialRequest?.end_date ?? formatDate(today));
+  const [strategies, setStrategies] = useState<Strategy[]>(initialRequest?.strategies ?? ['equal_weight', 'minimum_variance', 'maximum_sharpe']);
+  const [minWeight, setMinWeight] = useState(initialRequest?.min_weight ?? 0);
+  const [maxWeight, setMaxWeight] = useState(initialRequest?.max_weight ?? 1);
+  const [riskFreeRate, setRiskFreeRate] = useState(initialRequest?.risk_free_rate ?? 0.02);
+  const [monteCarloSamples, setMonteCarloSamples] = useState(initialRequest?.monte_carlo_samples ?? 1000);
+  const [frontierPoints, setFrontierPoints] = useState(initialRequest?.frontier_points ?? 20);
+  const [backtestEnabled, setBacktestEnabled] = useState(initialRequest?.backtest.enabled ?? true);
+  const [lookbackDays, setLookbackDays] = useState(initialRequest?.backtest.lookback_days ?? 252);
+  const [rebalanceEvery, setRebalanceEvery] = useState(initialRequest?.backtest.rebalance_every ?? 21);
+  const [transactionCostBps, setTransactionCostBps] = useState(initialRequest?.backtest.transaction_cost_bps ?? 10);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const toggleStrategy = (s: Strategy) => {
@@ -45,18 +46,19 @@ export default function AnalysisForm({ onSubmit, loading }: Props) {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canSubmit) return;
     onSubmit({
       tickers,
       start_date: startDate,
       end_date: endDate,
-      base_currency: 'USD',
+      base_currency: initialRequest?.base_currency ?? 'USD',
       strategies,
       min_weight: minWeight,
       max_weight: maxWeight,
       risk_free_rate: riskFreeRate,
       monte_carlo_samples: monteCarloSamples,
       frontier_points: frontierPoints,
-      random_seed: 42,
+      random_seed: initialRequest?.random_seed ?? 42,
       backtest: {
         enabled: backtestEnabled,
         lookback_days: lookbackDays,
@@ -170,7 +172,7 @@ export default function AnalysisForm({ onSubmit, loading }: Props) {
       )}
 
       <button type="submit" disabled={!canSubmit} className="submit-btn">
-        {loading ? 'Analyzing...' : 'Run Analysis'}
+        {loading ? 'Analyzing...' : initialRequest ? 'Rerun Analysis' : 'Run Analysis'}
       </button>
     </form>
   );

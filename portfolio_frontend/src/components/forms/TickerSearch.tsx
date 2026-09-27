@@ -57,7 +57,7 @@ export default function TickerSearch({ selected, onChange, max = 30 }: Props) {
         {selected.map((t) => (
           <span key={t} className="ticker-tag">
             {t}
-            <button onClick={() => removeTicker(t)} className="tag-remove" title="Remove">&times;</button>
+            <button type="button" onClick={() => removeTicker(t)} className="tag-remove" title="Remove" aria-label={`Remove ${t}`}>&times;</button>
           </span>
         ))}
       </div>

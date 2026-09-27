@@ -15,6 +15,7 @@ export default function App() {
         <main className="main-content">
           <Routes>
             <Route path="/" element={<NewAnalysis />} />
+            <Route path="/analysis/:id/edit" element={<NewAnalysis />} />
             <Route
               path="/analysis/:id"
               element={

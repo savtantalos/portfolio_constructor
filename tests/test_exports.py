@@ -285,7 +285,7 @@ def test_zip_and_individual_csv_match_preview_with_precision_and_safe_headers(ex
                 for expected, actual in zip(expected_row, actual_row, strict=True):
                     if expected is None:
                         assert actual == ""
-                    elif isinstance(expected, (float, int)):
+                    elif isinstance(expected, float | int):
                         assert float(actual) == expected
                         assert not actual.startswith("'")
                     else:

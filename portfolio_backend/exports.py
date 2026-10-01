@@ -50,7 +50,7 @@ UNITS = {
 
 
 def _cell(value: Any) -> str | int | float | None:
-    if isinstance(value, (float, np.floating)):
+    if isinstance(value, float | np.floating):
         return float(value) if math.isfinite(value) else None
     if isinstance(value, np.integer):
         return int(value)

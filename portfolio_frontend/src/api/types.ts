@@ -78,7 +78,17 @@ export interface BacktestResult {
   rebalances: RebalanceEvent[];
 }
 
+export interface EstimationSnapshot {
+  tickers: string[];
+  expected_annual_returns: number[];
+  optimizer_covariance_annual: number[][];
+  annualization_factor: 252;
+  mean_estimator: 'arithmetic_daily_mean';
+  covariance_estimator: 'LedoitWolf';
+}
+
 export interface AnalyticsResult {
+  estimation?: EstimationSnapshot | null;
   portfolios: PortfolioResult[];
   monte_carlo: PortfolioPoint[];
   efficient_frontier: PortfolioPoint[];
@@ -91,6 +101,20 @@ export interface PriceSnapshot {
   tickers: string[];
   dates: string[];
   prices: number[][];
+}
+
+export interface AnalysisDataset {
+  id: string;
+  title: string;
+  category: 'Market data' | 'Risk & estimates' | 'Portfolios' | 'Backtests';
+  description: string;
+  columns: string[];
+  rows: (string | number | null)[][];
+}
+
+export interface AnalysisDataResponse {
+  datasets: AnalysisDataset[];
+  notes: string[];
 }
 
 export interface DataSummary {

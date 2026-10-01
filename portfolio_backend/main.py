@@ -18,9 +18,11 @@ from portfolio_backend.analytics import analyze
 from portfolio_backend.config import Settings
 from portfolio_backend.database import AnalysisRepository
 from portfolio_backend.errors import PortfolioError
+from portfolio_backend.exports import build_data, render_archive, render_csv
 from portfolio_backend.market_data import YahooFinanceProvider
 from portfolio_backend.market_types import MarketDataProvider
 from portfolio_backend.models import (
+    AnalysisData,
     AnalysisRequest,
     AnalysisResponse,
     AnalysisSummary,
@@ -351,6 +353,60 @@ def create_app(
         if result is None:
             raise PortfolioError("analysis_not_found", "Analysis not found.", 404)
         return result
+
+    def load_analysis_data(analysis_id: UUID) -> tuple[dict, dict, AnalysisData]:
+        source = repository.get_export_source(str(analysis_id))
+        if source is None:
+            raise PortfolioError("analysis_not_found", "Analysis not found.", 404)
+        stored_analysis, stored_prices = source
+        data = build_data(
+            AnalysisResponse.model_validate(stored_analysis),
+            PriceSnapshot.model_validate(stored_prices),
+        )
+        return stored_analysis, stored_prices, data
+
+    @router.get("/analyses/{analysis_id}/data", response_model=AnalysisData, tags=["analyses"])
+    def get_analysis_data(analysis_id: UUID) -> AnalysisData:
+        return load_analysis_data(analysis_id)[2]
+
+    @router.get(
+        "/analyses/{analysis_id}/export",
+        response_class=Response,
+        responses={200: {"content": {"application/zip": {"schema": {
+            "type": "string", "format": "binary"
+        }}}}},
+        tags=["analyses"],
+    )
+    def export_analysis(analysis_id: UUID) -> Response:
+        stored_analysis, stored_prices, data = load_analysis_data(analysis_id)
+        return Response(
+            content=render_archive(stored_analysis, stored_prices, data),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="analysis-{analysis_id}.zip"'
+            },
+        )
+
+    @router.get(
+        "/analyses/{analysis_id}/export/{dataset_id}",
+        response_class=Response,
+        responses={200: {"content": {"text/csv": {"schema": {"type": "string"}}}}},
+        tags=["analyses"],
+    )
+    def export_analysis_dataset(analysis_id: UUID, dataset_id: str) -> Response:
+        data = load_analysis_data(analysis_id)[2]
+        dataset = next((item for item in data.datasets if item.id == dataset_id), None)
+        if dataset is None:
+            raise PortfolioError("dataset_not_found", "Dataset not found.", 404)
+        return Response(
+            content=render_csv(dataset),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="analysis-{analysis_id}-{dataset.id}.csv"'
+                )
+            },
+        )
 
     app.include_router(router)
     return app

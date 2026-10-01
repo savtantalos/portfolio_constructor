@@ -12,6 +12,7 @@ from .models import (
     BacktestMetrics,
     BacktestResult,
     EquityPoint,
+    EstimationSnapshot,
     PortfolioPoint,
     PortfolioResult,
     RebalanceEvent,
@@ -680,4 +681,9 @@ def analyze(prices: pd.DataFrame, request: AnalysisRequest) -> AnalyticsResult:
         correlation=correlation,
         backtests=backtests,
         warnings=warnings,
+        estimation=EstimationSnapshot(
+            tickers=list(request.tickers),
+            expected_annual_returns=mu.tolist(),
+            optimizer_covariance_annual=covariance.tolist(),
+        ),
     )

@@ -118,6 +118,17 @@ class AnalysisRepository:
             )
             return AnalysisResponse.model_validate(payload) if payload is not None else None
 
+    def get_export_source(
+        self, analysis_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        with Session(self.engine) as session:
+            row = session.execute(
+                select(AnalysisRecord.result, AnalysisRecord.price_snapshot).where(
+                    AnalysisRecord.id == analysis_id
+                )
+            ).first()
+            return (row[0], row[1]) if row is not None else None
+
     def get_prices(self, analysis_id: str) -> dict[str, Any] | None:
         with Session(self.engine) as session:
             return session.scalar(

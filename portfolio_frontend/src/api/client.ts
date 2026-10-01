@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type {
+  AnalysisDataResponse,
   AnalysisRequest,
   AnalysisResponse,
   AnalysisSummary,
@@ -60,6 +61,29 @@ export async function getAnalysisPrices(id: string): Promise<PriceSnapshot> {
     `/api/v1/analyses/${id}/prices`
   );
   return data;
+}
+
+export async function getAnalysisData(id: string, signal?: AbortSignal): Promise<AnalysisDataResponse> {
+  const { data } = await api.get<AnalysisDataResponse>(`/api/v1/analyses/${id}/data`, { signal });
+  return data;
+}
+
+export async function getAnalysisExport(id: string, datasetId?: string): Promise<Blob> {
+  try {
+    const path = datasetId ? `/export/${encodeURIComponent(datasetId)}` : '/export';
+    const { data } = await api.get<Blob>(`/api/v1/analyses/${id}${path}`, { responseType: 'blob' });
+    return data;
+  } catch (err) {
+    if (axios.isAxiosError(err) && err.response?.data instanceof Blob) {
+      const body = await err.response.data.text();
+      try {
+        err.response.data = JSON.parse(body);
+      } catch {
+        err.response.data = undefined;
+      }
+    }
+    throw err;
+  }
 }
 
 export function extractError(err: unknown): string {

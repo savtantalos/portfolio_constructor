@@ -12,6 +12,7 @@ import EquityCurveChart from '../components/charts/EquityCurveChart';
 import DrawdownChart from '../components/charts/DrawdownChart';
 import RiskContributionChart from '../components/charts/RiskContributionChart';
 import PriceChart from '../components/charts/PriceChart';
+import AnalysisData from '../components/AnalysisData';
 
 interface Props {
   theme: ColorTheme;
@@ -26,7 +27,7 @@ export default function AnalysisView({ theme, themeName, themeNames, setTheme }:
   const [prices, setPrices] = useState<PriceSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [activeTab, setActiveTab] = useState<'overview' | 'frontier' | 'backtest' | 'prices' | 'warnings'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'frontier' | 'backtest' | 'prices' | 'data' | 'warnings'>('overview');
 
   useEffect(() => {
     if (!id) return;
@@ -48,6 +49,7 @@ export default function AnalysisView({ theme, themeName, themeNames, setTheme }:
     { key: 'frontier' as const, label: 'Frontier & Monte Carlo' },
     ...(results.backtests.length > 0 ? [{ key: 'backtest' as const, label: 'Backtesting' }] : []),
     ...(prices ? [{ key: 'prices' as const, label: 'Returns & Volatility' }] : []),
+    { key: 'data' as const, label: 'Data & Downloads' },
     ...(results.warnings.length > 0 ? [{ key: 'warnings' as const, label: `Warnings (${results.warnings.length})` }] : []),
   ];
 
@@ -126,6 +128,8 @@ export default function AnalysisView({ theme, themeName, themeNames, setTheme }:
           </div>
         </div>
       )}
+
+      {activeTab === 'data' && <AnalysisData key={analysis.id} analysis={analysis} />}
 
       {activeTab === 'warnings' && results.warnings.length > 0 && (
         <div className="tab-content">

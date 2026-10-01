@@ -195,6 +195,15 @@ class BacktestResult(StrictModel):
     rebalances: list[RebalanceEvent]
 
 
+class EstimationSnapshot(StrictModel):
+    tickers: list[str]
+    expected_annual_returns: list[float]
+    optimizer_covariance_annual: list[list[float]]
+    annualization_factor: Literal[252] = 252
+    mean_estimator: Literal["arithmetic_daily_mean"] = "arithmetic_daily_mean"
+    covariance_estimator: Literal["LedoitWolf"] = "LedoitWolf"
+
+
 class AnalyticsResult(StrictModel):
     """Allocations, sampled portfolios, frontier, correlations, and backtests.
 
@@ -208,6 +217,21 @@ class AnalyticsResult(StrictModel):
     correlation: dict[str, dict[str, float | None]]
     backtests: list[BacktestResult]
     warnings: list[str]
+    estimation: EstimationSnapshot | None = None
+
+
+class AnalysisDataset(StrictModel):
+    id: str
+    title: str
+    category: Literal["Market data", "Risk & estimates", "Portfolios", "Backtests"]
+    description: str
+    columns: list[str]
+    rows: list[list[str | int | float | None]]
+
+
+class AnalysisData(StrictModel):
+    datasets: list[AnalysisDataset]
+    notes: list[str]
 
 
 class PriceSnapshot(StrictModel):

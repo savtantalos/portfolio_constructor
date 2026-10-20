@@ -1,22 +1,19 @@
-import hashlib
-import json
 import secrets
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from threading import BoundedSemaphore
 from typing import Annotated
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from sqlalchemy.exc import SQLAlchemyError
 
 from portfolio_backend import __version__
-from portfolio_backend.analytics import analyze
+from portfolio_backend.assistant import Assistant, LLMClient, build_llm_client
 from portfolio_backend.config import Settings
-from portfolio_backend.database import AnalysisRepository
+from portfolio_backend.database import AnalysisRepository, ConversationRepository
 from portfolio_backend.errors import PortfolioError
 from portfolio_backend.exports import build_data, render_archive, render_csv
 from portfolio_backend.market_data import YahooFinanceProvider
@@ -26,28 +23,25 @@ from portfolio_backend.models import (
     AnalysisRequest,
     AnalysisResponse,
     AnalysisSummary,
-    DataSummary,
+    AssistantStatus,
+    ChatSendRequest,
+    ConversationCreate,
+    ConversationDetail,
+    ConversationSummary,
     ErrorResponse,
     HealthResponse,
     Instrument,
     PriceSnapshot,
 )
+from portfolio_backend.service import ASSUMPTIONS, perform_analysis
 
-ASSUMPTIONS = [
-    "Research tool, not an investment recommendation or a guarantee of future performance.",
-    "Long-only, fully invested fractional allocations; no leverage, shorting, taxes, or whole-share rounding.",
-    "Daily dividend- and split-adjusted closing prices; distributions are not added again.",
-    "All instruments must share the base currency. FX and currency-subunit conversion are unsupported.",
-    "252 trading observations per year; missing-date alignment can affect this approximation.",
-    "Weight bounds apply to target allocations at rebalances, not to weights drifting between them.",
-    "Backtest costs model proportional traded-notional fees only, not market impact or execution slippage.",
-    "Backtests are conditional on today's selected asset list and can contain selection/survivorship bias.",
-    "The data-provider license must permit your intended use, storage, and display of market data.",
-]
+__all__ = ["ASSUMPTIONS", "app", "create_app"]
 
 
 def create_app(
-    settings: Settings | None = None, provider: MarketDataProvider | None = None
+    settings: Settings | None = None,
+    provider: MarketDataProvider | None = None,
+    llm: LLMClient | None = None,
 ) -> FastAPI:
     """Build the shared-workspace API and its application-scoped dependencies.
 
@@ -55,6 +49,8 @@ def create_app(
         settings: Configuration to use; otherwise load default settings.
         provider: Market-data implementation; otherwise create a configured
             Yahoo Finance provider with an in-process cache.
+        llm: Language-model client for the assistant; otherwise build an
+            Anthropic client when an API key is configured, or disable it.
 
     Returns:
         An app with optional CORS and API-key protection on `/api/v1` routes.
@@ -75,6 +71,8 @@ def create_app(
         timeout_seconds=configuration.provider_timeout_seconds,
     )
     slots = BoundedSemaphore(configuration.max_concurrent_analyses)
+    conversations = ConversationRepository(repository.engine)
+    llm_client = llm or build_llm_client(configuration)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -211,6 +209,23 @@ def create_app(
             raise PortfolioError("invalid_search", "Search query cannot be blank.")
         return market_data.search(q.strip(), limit)
 
+    def run_analysis(payload: AnalysisRequest) -> AnalysisResponse:
+        """Run and persist an analysis inside one bounded per-app slot.
+
+        Raises:
+            PortfolioError: HTTP 503 if no analysis slot is immediately available.
+        """
+        if not slots.acquire(blocking=False):
+            raise PortfolioError(
+                "analysis_capacity_reached", "Analysis workers are busy. Retry later.", 503
+            )
+        try:
+            return perform_analysis(
+                payload, market_data=market_data, repository=repository, settings=configuration
+            )
+        finally:
+            slots.release()
+
     @router.post("/analyses", response_model=AnalysisResponse, status_code=201, tags=["analyses"])
     def create_analysis(payload: AnalysisRequest, response: Response) -> AnalysisResponse:
         """Compute and persist an analysis and its auditable price snapshot.
@@ -235,66 +250,9 @@ def create_app(
             computation, and transactional storage, and is released on every exit.
             Successful requests store both results and prices in shared storage.
         """
-        if not slots.acquire(blocking=False):
-            raise PortfolioError(
-                "analysis_capacity_reached", "Analysis workers are busy. Retry later.", 503
-            )
-        try:
-            dataset = market_data.history(
-                payload.tickers, payload.start_date, payload.end_date, payload.base_currency
-            )
-            observations = len(dataset.prices)
-            if payload.backtest.enabled:
-                periods = max(0, observations - payload.backtest.lookback_days - 1)
-                rebalances = (
-                    periods + payload.backtest.rebalance_every - 1
-                ) // payload.backtest.rebalance_every
-                if rebalances > configuration.max_backtest_rebalances:
-                    raise PortfolioError(
-                        "backtest_budget_exceeded",
-                        "This analysis exceeds the backtest rebalance budget. Increase rebalance_every, "
-                        "shorten the historical window, or disable backtesting.",
-                    )
-            results = analyze(dataset.prices, payload)
-            results.warnings = dataset.warnings + results.warnings
-            ordered_prices = dataset.prices.loc[:, payload.tickers]
-            snapshot = PriceSnapshot(
-                tickers=payload.tickers,
-                dates=[value.date() for value in ordered_prices.index],
-                prices=ordered_prices.to_numpy(dtype=float).tolist(),
-            ).model_dump(mode="json")
-            snapshot_hash = hashlib.sha256(
-                json.dumps(
-                    snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False
-                ).encode()
-            ).hexdigest()
-            result = AnalysisResponse(
-                id=str(uuid4()),
-                created_at=datetime.now(UTC),
-                engine_version=__version__,
-                request=payload,
-                data=DataSummary(
-                    provider=dataset.provider,
-                    fetched_at=dataset.fetched_at,
-                    requested_start=payload.start_date,
-                    requested_end=payload.end_date,
-                    effective_start=ordered_prices.index[0].date(),
-                    effective_end=ordered_prices.index[-1].date(),
-                    price_observations=observations,
-                    return_observations=observations - 1,
-                    currency=payload.base_currency,
-                    adjustment=dataset.adjustment,
-                    snapshot_sha256=snapshot_hash,
-                    instruments=dataset.instruments,
-                ),
-                results=results,
-                assumptions=ASSUMPTIONS,
-            )
-            repository.save(result, snapshot)
-            response.headers["Location"] = f"/api/v1/analyses/{result.id}"
-            return result
-        finally:
-            slots.release()
+        result = run_analysis(payload)
+        response.headers["Location"] = f"/api/v1/analyses/{result.id}"
+        return result
 
     @router.get("/analyses", response_model=list[AnalysisSummary], tags=["analyses"])
     def list_analyses(
@@ -406,6 +364,75 @@ def create_app(
                     f'attachment; filename="analysis-{analysis_id}-{dataset.id}.csv"'
                 )
             },
+        )
+
+    assistant = Assistant(
+        settings=configuration,
+        llm=llm_client,
+        repository=repository,
+        conversations=conversations,
+        market_data=market_data,
+        run_analysis=run_analysis,
+    )
+
+    @router.get("/assistant/status", response_model=AssistantStatus, tags=["assistant"])
+    def assistant_status() -> AssistantStatus:
+        """Report whether the assistant is configured, without probing the provider."""
+        return AssistantStatus(enabled=assistant.enabled, model=configuration.assistant_model)
+
+    @router.post(
+        "/conversations", response_model=ConversationDetail, status_code=201, tags=["assistant"]
+    )
+    def create_conversation(payload: ConversationCreate) -> ConversationDetail:
+        """Start an empty conversation, optionally attached to a saved analysis.
+
+        Raises:
+            PortfolioError: HTTP 404 if the referenced analysis does not exist.
+        """
+        if payload.analysis_id and repository.get(payload.analysis_id) is None:
+            raise PortfolioError("analysis_not_found", "Analysis not found.", 404)
+        return conversations.create(payload.analysis_id)
+
+    @router.get("/conversations", response_model=list[ConversationSummary], tags=["assistant"])
+    def list_conversations(
+        analysis_id: Annotated[UUID | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    ) -> list[ConversationSummary]:
+        """List recent conversations, optionally filtered to one analysis."""
+        return conversations.list(str(analysis_id) if analysis_id else None, limit)
+
+    @router.get(
+        "/conversations/{conversation_id}", response_model=ConversationDetail, tags=["assistant"]
+    )
+    def get_conversation(conversation_id: UUID) -> ConversationDetail:
+        """Read one conversation and its stored messages.
+
+        Raises:
+            PortfolioError: HTTP 404 if no matching conversation exists.
+        """
+        result = conversations.get(str(conversation_id))
+        if result is None:
+            raise PortfolioError("conversation_not_found", "Conversation not found.", 404)
+        return result
+
+    @router.post(
+        "/conversations/{conversation_id}/messages",
+        response_class=StreamingResponse,
+        responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}},
+        tags=["assistant"],
+    )
+    def send_message(conversation_id: UUID, payload: ChatSendRequest) -> StreamingResponse:
+        """Stream the assistant's reply to a new user message as server-sent events.
+
+        Raises:
+            PortfolioError: HTTP 404 if the conversation is missing; HTTP 503 if
+                the assistant is disabled or all assistant turns are busy.
+        """
+        events = assistant.start_turn(str(conversation_id), payload)
+        return StreamingResponse(
+            events,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     app.include_router(router)

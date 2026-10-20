@@ -1,6 +1,7 @@
 import type { PortfolioPoint, PortfolioResult } from '../../api/types';
 import type { ColorTheme } from '../../hooks/useColorTheme';
 import PlotWrapper from './PlotWrapper';
+import { STRATEGY_LABELS, strategyColor } from '../strategyMetadata';
 
 interface Props {
   frontier: PortfolioPoint[];
@@ -13,12 +14,9 @@ const STRATEGY_SYMBOLS: Record<string, string> = {
   equal_weight: 'diamond',
   minimum_variance: 'star',
   maximum_sharpe: 'hexagram',
-};
-
-const STRATEGY_LABELS: Record<string, string> = {
-  equal_weight: 'Equal Weight',
-  minimum_variance: 'Min Variance',
-  maximum_sharpe: 'Max Sharpe',
+  buy_and_hold: 'square',
+  inverse_volatility: 'triangle-up',
+  equal_risk_contribution: 'cross',
 };
 
 export default function FrontierChart({ frontier, monteCarlo, portfolios, theme }: Props) {
@@ -49,20 +47,20 @@ export default function FrontierChart({ frontier, monteCarlo, portfolios, theme 
     });
   }
 
-  portfolios.forEach((p, i) => {
+  portfolios.forEach((p) => {
     data.push({
       x: [p.metrics.annual_volatility * 100],
       y: [p.metrics.expected_annual_return * 100],
       mode: 'markers',
       type: 'scatter',
-      name: STRATEGY_LABELS[p.strategy] || p.strategy,
+      name: STRATEGY_LABELS[p.strategy],
       marker: {
-        color: theme.colors[(i + 1) % theme.colors.length],
+        color: strategyColor(p.strategy, theme.colors),
         size: 14,
         symbol: STRATEGY_SYMBOLS[p.strategy] || 'circle',
         line: { width: 2, color: theme.text },
       },
-      hovertemplate: `${STRATEGY_LABELS[p.strategy] || p.strategy}<br>Vol: %{x:.2f}%<br>Return: %{y:.2f}%<extra></extra>`,
+      hovertemplate: `${STRATEGY_LABELS[p.strategy]}<br>Vol: %{x:.2f}%<br>Return: %{y:.2f}%<extra></extra>`,
     });
   });
 

@@ -23,7 +23,7 @@ export default function PlotWrapper({
   extraLayout = {},
 }: Props) {
   const layout: Partial<Plotly.Layout> = {
-    title: { text: title, font: { color: theme.text, size: 16 } },
+    title: { text: title, font: { color: theme.text, size: 14 }, x: 0.04, xanchor: 'left' },
     paper_bgcolor: theme.paper,
     plot_bgcolor: theme.bg,
     font: { color: theme.text, family: "'Inter', system-ui, sans-serif" },
@@ -47,18 +47,20 @@ export default function PlotWrapper({
   };
 
   return (
-    <Plot
-      data={data}
-      layout={layout}
-      config={{
-        responsive: true,
-        displayModeBar: true,
-        modeBarButtonsToAdd: ['toImage'],
-        displaylogo: false,
-        toImageButtonOptions: { format: 'png', height: 800, width: 1400, scale: 2 },
-      }}
-      style={{ width: '100%', height }}
-      useResizeHandler
-    />
+    <section className="chart-panel" aria-label={title}>
+      <Plot
+        data={data}
+        layout={layout}
+        config={{
+          responsive: true,
+          displayModeBar: true,
+          modeBarButtonsToAdd: ['toImage'],
+          displaylogo: false,
+          toImageButtonOptions: { format: 'png', height: 800, width: 1400, scale: 2 },
+        }}
+        style={{ width: '100%', height }}
+        useResizeHandler
+      />
+    </section>
   );
 }

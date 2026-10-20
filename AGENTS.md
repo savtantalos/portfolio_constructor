@@ -9,6 +9,7 @@
 
 # Backend verification
 
+- Start the local API from the repository root with `.venv/bin/python -m uvicorn portfolio_backend.main:app --host 127.0.0.1 --port 8000`. Without `--reload`, restart it after backend changes; Vite reloads only the frontend. A generic 404 for a newly added endpoint can indicate a stale backend; check its live `/openapi.json` routes.
 - Run `.venv/bin/python -m pytest -q` from the repository root; tests use synthetic providers and temporary SQLite databases.
 - `.venv/bin/python -m pytest tests/test_exports.py tests/test_analytics.py -q` verifies data exports and portfolio calculations. `.venv/bin/ruff check portfolio_backend tests` runs backend lint.
 - The existing API suite has four baseline failures: nonfinite JSON request validation (NaN and positive/negative Infinity) and empty API-key configuration. Existing backend code also has lint violations; distinguish these from new failures.

@@ -1,10 +1,19 @@
 import numpy as np
 import pandas as pd
 import pytest
+from pydantic import ValidationError
 
-from portfolio_backend.analytics import analyze
+from portfolio_backend.analytics import _backtest, _backtest_metrics, _weights, analyze
 from portfolio_backend.errors import PortfolioError
-from portfolio_backend.models import AnalysisRequest, BacktestConfig, Strategy
+from portfolio_backend.models import (
+    AnalysisRequest,
+    AnalyticsResult,
+    BacktestConfig,
+    BacktestMetrics,
+    EquityPoint,
+    RebalanceEvent,
+    Strategy,
+)
 
 
 def prices_from_returns(returns):
@@ -457,3 +466,500 @@ def test_sampler_retries_zero_directions_without_losing_samples(monkeypatch):
     result = analyze(prices, request_for(prices, min_weight=0.1, max_weight=0.6))
     assert len(result.monte_carlo) == 12
     assert_feasible(result.monte_carlo, 0.1, 0.6)
+
+
+def test_original_default_strategies_and_legacy_result_fields():
+    prices = synthetic_prices()
+    request = request_for(prices)
+    assert request.strategies == [
+        Strategy.EQUAL_WEIGHT,
+        Strategy.MINIMUM_VARIANCE,
+        Strategy.MAXIMUM_SHARPE,
+    ]
+    assert request.benchmark_ticker is None
+    result = analyze(prices, request)
+    assert result.benchmark is None
+    legacy = result.model_dump(exclude={"benchmark"})
+    assert AnalyticsResult.model_validate(legacy).benchmark is None
+    metrics = BacktestMetrics(
+        total_return=0,
+        cagr=0,
+        annual_volatility=0,
+        sharpe_ratio=None,
+        max_drawdown=0,
+        total_turnover=0,
+        total_transaction_cost=0,
+    )
+    for field in (
+        "sortino_ratio", "calmar_ratio", "max_drawdown_duration_days", "tracking_error",
+        "information_ratio", "excess_total_return",
+    ):
+        assert getattr(metrics, field) is None
+
+
+def test_benchmark_request_normalizes_and_requires_backtest():
+    prices = synthetic_prices()
+    request = request_for(
+        prices, benchmark_ticker="  ^gspc ", backtest=BacktestConfig(lookback_days=60)
+    )
+    assert request.benchmark_ticker == "^GSPC"
+    with pytest.raises(ValidationError, match="requires an enabled backtest"):
+        request_for(prices, benchmark_ticker="SPY")
+    for symbol in ("", "A B", "bad/symbol", ".SPY", "X" * 33, 123):
+        with pytest.raises(ValidationError):
+            request_for(
+                prices, benchmark_ticker=symbol, backtest=BacktestConfig(lookback_days=60)
+            )
+
+
+@pytest.mark.parametrize(
+    "strategy", [Strategy.INVERSE_VOLATILITY, Strategy.EQUAL_RISK_CONTRIBUTION]
+)
+def test_diagonal_risk_allocations_match_inverse_standard_deviations(strategy):
+    prices = synthetic_prices()
+    request = request_for(prices, strategies=[strategy])
+    covariance = np.diag([0.01, 0.04, 0.16])
+    weights = _weights(strategy, np.zeros(3), covariance, request)
+    expected = np.array([1, 0.5, 0.25]) / 1.75
+    np.testing.assert_allclose(weights, expected, atol=1e-7)
+    contributions = weights * (covariance @ weights)
+    np.testing.assert_allclose(contributions / contributions.sum(), np.full(3, 1 / 3), atol=1e-7)
+
+
+def test_inverse_volatility_capping_preserves_free_asset_proportions():
+    prices = synthetic_prices()
+    request = request_for(prices, min_weight=0.1, max_weight=0.5)
+    weights = _weights(
+        Strategy.INVERSE_VOLATILITY, np.zeros(3), np.diag([0.01, 0.04, 0.16]), request
+    )
+    np.testing.assert_allclose(weights, [0.5, 1 / 3, 1 / 6], atol=1e-8)
+    covariance = np.diag([0.01, 0.04, 100])
+    weights = _weights(Strategy.INVERSE_VOLATILITY, np.zeros(3), covariance, request)
+    np.testing.assert_allclose(weights, [0.5, 0.4, 0.1], atol=1e-8)
+
+
+def test_equal_risk_contribution_uses_off_diagonal_covariance():
+    prices = synthetic_prices()
+    request = request_for(prices)
+    covariance = np.array([[0.04, 0.012, 0.005], [0.012, 0.09, 0.024], [0.005, 0.024, 0.16]])
+    erc = _weights(Strategy.EQUAL_RISK_CONTRIBUTION, np.zeros(3), covariance, request)
+    inverse = _weights(Strategy.INVERSE_VOLATILITY, np.zeros(3), covariance, request)
+    contributions = erc * (covariance @ erc)
+    np.testing.assert_allclose(contributions / contributions.sum(), np.full(3, 1 / 3), atol=2e-6)
+    assert not np.allclose(erc, inverse, atol=1e-4)
+    inverse_diagonal = _weights(
+        Strategy.INVERSE_VOLATILITY, np.zeros(3), np.diag(np.diag(covariance)), request
+    )
+    np.testing.assert_allclose(inverse, inverse_diagonal)
+
+
+@pytest.mark.parametrize(
+    "strategy", [Strategy.INVERSE_VOLATILITY, Strategy.EQUAL_RISK_CONTRIBUTION]
+)
+@pytest.mark.parametrize("minimum,maximum", [(0.32, 0.35), (1 / 3, 1 / 3), (0, 1 / 3), (1 / 3, 1)])
+def test_new_risk_strategies_respect_tight_bounds(strategy, minimum, maximum):
+    prices = synthetic_prices()
+    request = request_for(
+        prices, strategies=[strategy], min_weight=minimum, max_weight=maximum,
+        monte_carlo_samples=0, frontier_points=0,
+    )
+    result = analyze(prices, request)
+    assert_feasible(result.portfolios, minimum, maximum)
+    if strategy == Strategy.EQUAL_RISK_CONTRIBUTION:
+        assert any(
+            "weight bounds may prevent equal risk contributions" in w for w in result.warnings
+        )
+
+
+@pytest.mark.parametrize(
+    "strategy", [Strategy.INVERSE_VOLATILITY, Strategy.EQUAL_RISK_CONTRIBUTION]
+)
+@pytest.mark.parametrize("maximum", [0.5, 1])
+def test_new_risk_strategies_stable_with_zero_variance(strategy, maximum):
+    prices = prices_from_returns(np.zeros((70, 3)))
+    request = request_for(
+        prices, strategies=[strategy], max_weight=maximum,
+        backtest=BacktestConfig(lookback_days=60, transaction_cost_bps=0),
+        monte_carlo_samples=0, frontier_points=0,
+    )
+    result = analyze(prices, request)
+    np.testing.assert_allclose(list(result.portfolios[0].weights.values()), np.full(3, 1 / 3))
+    assert list(result.portfolios[0].risk_contributions.values()) == [0, 0, 0]
+    assert result.backtests[0].metrics.total_return == 0
+    mixed = _weights(strategy, np.zeros(3), np.diag([0, 0.04, 0.09]), request)
+    assert np.isfinite(mixed).all()
+    assert mixed.sum() == pytest.approx(1)
+    assert mixed.min() >= 0
+    assert mixed.max() <= maximum + 1e-8
+    assert mixed[0] == pytest.approx(maximum, abs=1e-6)
+
+
+def test_bounded_equal_risk_contribution_matches_dense_objective_search():
+    prices = synthetic_prices(assets=2)
+    request = request_for(prices, min_weight=0.45, max_weight=0.55)
+    covariance = np.array([[0.01, 0.005], [0.005, 0.09]])
+    weights = _weights(Strategy.EQUAL_RISK_CONTRIBUTION, np.zeros(2), covariance, request)
+    grid_first = np.linspace(0.45, 0.55, 10001)
+    grid = np.column_stack([grid_first, 1 - grid_first])
+    contributions = grid * (grid @ covariance)
+    differences = contributions - contributions.mean(axis=1, keepdims=True)
+    objectives = np.sum(differences**2, axis=1)
+    actual = weights * (covariance @ weights)
+    assert np.sum((actual - actual.mean()) ** 2) <= objectives.min() + 1e-10
+    assert weights[0] == pytest.approx(0.55, abs=1e-7)
+
+
+def test_equal_risk_contribution_zero_risk_hedge_is_stable():
+    prices = synthetic_prices(assets=2)
+    weights = _weights(
+        Strategy.EQUAL_RISK_CONTRIBUTION,
+        np.zeros(2),
+        np.array([[1, -1], [-1, 1]]),
+        request_for(prices),
+    )
+    np.testing.assert_allclose(weights, [0.5, 0.5])
+
+
+def test_buy_and_hold_has_one_entry_then_drifts_with_only_entry_cost(monkeypatch):
+    import portfolio_backend.analytics as analytics
+
+    returns = np.zeros((66, 2))
+    returns[60] = [0.5, 0.7]
+    returns[61] = [0.2, 0]
+    returns[62] = [0.1, -0.1]
+    prices = prices_from_returns(returns)
+    request = request_for(
+        prices, strategies=[Strategy.BUY_AND_HOLD], min_weight=0.5, max_weight=0.5,
+        backtest=BacktestConfig(lookback_days=60, rebalance_every=1, transaction_cost_bps=100),
+        monte_carlo_samples=0, frontier_points=0,
+    )
+    result = analyze(prices, request)
+    assert result.portfolios[0].weights == {"A0": 0.5, "A1": 0.5}
+    backtest = result.backtests[0]
+    assert len(backtest.rebalances) == 1
+    event = backtest.rebalances[0]
+    assert event.date == prices.index[61].date()
+    assert event.weights == {"A0": 0.5, "A1": 0.5}
+    assert event.turnover == 1
+    assert event.transaction_cost == pytest.approx(0.01)
+    assert [p.value for p in backtest.equity_curve[:4]] == pytest.approx(
+        [1, 0.99, 0.99 * 1.1, 0.495 * (1.2 * 1.1 + 0.9)]
+    )
+    assert backtest.metrics.total_turnover == 1
+    assert backtest.metrics.total_transaction_cost == pytest.approx(0.01)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Buy-and-hold must not fit rolling estimators")
+
+    monkeypatch.setattr(analytics, "_estimate", fail)
+    direct = _backtest(returns, prices.index, Strategy.BUY_AND_HOLD, request)
+    np.testing.assert_allclose(
+        [p.value for p in direct.equity_curve], [p.value for p in backtest.equity_curve]
+    )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [Strategy.BUY_AND_HOLD, Strategy.INVERSE_VOLATILITY, Strategy.EQUAL_RISK_CONTRIBUTION],
+)
+def test_new_strategies_lag_training_and_exclude_future_prices(strategy):
+    prices = synthetic_prices(count=105)
+    request = request_for(
+        prices, strategies=[strategy],
+        backtest=BacktestConfig(lookback_days=60, rebalance_every=10, transaction_cost_bps=10),
+        monte_carlo_samples=0, frontier_points=0,
+    )
+    original = analyze(prices, request).backtests[0]
+    training = prices.iloc[:61]
+    fitted = analyze(training, request_for(
+        training, strategies=[strategy], monte_carlo_samples=0, frontier_points=0,
+    ))
+    assert original.rebalances[0].weights == fitted.portfolios[0].weights
+    changed = prices.copy()
+    changed.iloc[61:, 0] *= 1.5
+    altered = analyze(changed, request).backtests[0]
+    assert original.rebalances[0] == altered.rebalances[0]
+    assert original.equity_curve[:2] == altered.equity_curve[:2]
+    changed = prices.copy()
+    changed.iloc[85:, 1] *= 1.2
+    altered = analyze(changed, request).backtests[0]
+    cutoff = prices.index[85].date()
+    assert [p for p in original.equity_curve if p.date < cutoff] == [
+        p for p in altered.equity_curve if p.date < cutoff
+    ]
+    assert [e for e in original.rebalances if e.date <= cutoff] == [
+        e for e in altered.rebalances if e.date <= cutoff
+    ]
+
+
+def equity_from_values(values, dates):
+    peaks = np.maximum.accumulate(values)
+    return [
+        EquityPoint(date=pd.Timestamp(day).date(), value=value, drawdown=value / peak - 1)
+        for day, value, peak in zip(dates, values, peaks, strict=True)
+    ]
+
+
+def test_realized_metrics_match_hand_calculation_and_calendar_recovery_duration():
+    values = [1, 1.1, 0.99, 1.05, 1.1, 1.2, 1.08]
+    dates = ["2020-01-01", "2020-01-02", "2020-01-05", "2020-01-07", "2020-01-11",
+             "2020-01-12", "2020-01-20"]
+    equity = equity_from_values(values, dates)
+    events = [RebalanceEvent(
+        date=equity[1].date, weights={"A0": 1}, turnover=1, transaction_cost=0.01
+    )]
+    metrics = _backtest_metrics(equity, events, 0.0252)
+    returns = np.array([0.1, -0.1, 1.05 / 0.99 - 1, 1.1 / 1.05 - 1, 1.2 / 1.1 - 1, -0.1])
+    excess = returns - 0.0001
+    downside = np.sqrt(np.sum(np.minimum(excess, 0) ** 2) / 6) * np.sqrt(252)
+    cagr = 1.08 ** (365.25 / 19) - 1
+    assert metrics.total_return == pytest.approx(0.08)
+    assert metrics.cagr == pytest.approx(cagr)
+    assert metrics.annual_volatility == pytest.approx(returns.std(ddof=1) * np.sqrt(252))
+    assert metrics.sortino_ratio == pytest.approx(excess.mean() * 252 / downside)
+    assert metrics.sharpe_ratio == pytest.approx(excess.mean() * 252 / metrics.annual_volatility)
+    assert metrics.calmar_ratio == pytest.approx(cagr / 0.1)
+    assert metrics.max_drawdown == pytest.approx(-0.1)
+    assert metrics.max_drawdown_duration_days == 9
+    assert metrics.total_turnover == 1
+    assert metrics.total_transaction_cost == 0.01
+    assert metrics.tracking_error is None
+    assert metrics.information_ratio is None
+    assert metrics.excess_total_return is None
+
+
+@pytest.mark.parametrize(
+    "values,dates,duration",
+    [
+        ([1, 0.9, 0.8], ["2020-01-01", "2020-01-03", "2020-01-20"], 19),
+        ([1, 1, 0.9, 1], ["2020-01-01", "2020-01-05", "2020-01-06", "2020-01-10"], 5),
+        ([1, 1, 1.1], ["2020-01-01", "2020-01-03", "2020-01-20"], 0),
+    ],
+)
+def test_drawdown_duration_counts_peak_to_recovery_or_end(values, dates, duration):
+    metrics = _backtest_metrics(equity_from_values(values, dates), [], 0)
+    assert metrics.max_drawdown_duration_days == duration
+
+
+def test_ratio_zero_denominators_and_identical_benchmark_returns():
+    dates = pd.date_range("2020-01-01", periods=4)
+    equity = equity_from_values([1, 1, 1, 1], dates)
+    metrics = _backtest_metrics(equity, [], 0, equity)
+    assert metrics.sortino_ratio is None
+    assert metrics.calmar_ratio is None
+    assert metrics.sharpe_ratio is None
+    assert metrics.information_ratio is None
+    assert metrics.tracking_error == 0
+    assert metrics.excess_total_return == 0
+    assert metrics.max_drawdown_duration_days == 0
+    positive = equity_from_values([1, 1.01, 1.03, 1.04], dates)
+    positive_metrics = _backtest_metrics(positive, [], 0)
+    assert positive_metrics.sortino_ratio is None
+    assert positive_metrics.calmar_ratio is None
+
+
+def test_benchmark_buy_and_hold_entry_cost_dates_and_relative_metrics():
+    returns = np.zeros((66, 2))
+    returns[61:] = [[0.02, -0.01], [-0.03, 0.01], [0.04, 0], [0, 0.03], [0.01, 0]]
+    prices = prices_from_returns(returns)
+    benchmark_returns = np.zeros((66, 1))
+    benchmark_returns[60] = 0.9
+    benchmark_returns[61:, 0] = [0.01, -0.02, 0.02, -0.01, 0.01]
+    benchmark_prices = prices_from_returns(benchmark_returns).iloc[:, 0]
+    request = request_for(
+        prices, strategies=[Strategy.BUY_AND_HOLD, Strategy.EQUAL_WEIGHT], benchmark_ticker="SPY",
+        min_weight=0.5, max_weight=0.5,
+        backtest=BacktestConfig(lookback_days=60, rebalance_every=1, transaction_cost_bps=100),
+        monte_carlo_samples=0, frontier_points=0,
+    )
+    result = analyze(prices, request, benchmark_prices)
+    benchmark = result.benchmark
+    assert benchmark.ticker == "SPY"
+    assert len(benchmark.rebalances) == 1
+    assert benchmark.rebalances[0].date == prices.index[61].date()
+    assert benchmark.rebalances[0].weights == {"SPY": 1}
+    assert benchmark.rebalances[0].turnover == 1
+    assert benchmark.rebalances[0].transaction_cost == pytest.approx(0.01)
+    assert benchmark.metrics.total_transaction_cost == pytest.approx(0.01)
+    assert benchmark.metrics.total_turnover == 1
+    expected_nav = np.r_[1, 0.99, 0.99 * np.cumprod(1 + benchmark_returns[61:, 0])]
+    np.testing.assert_allclose([p.value for p in benchmark.equity_curve], expected_nav)
+    assert benchmark.metrics.tracking_error is None
+    assert benchmark.metrics.information_ratio is None
+    assert benchmark.metrics.excess_total_return is None
+    net_benchmark = expected_nav[1:] / expected_nav[:-1] - 1
+    for backtest in result.backtests:
+        assert [p.date for p in backtest.equity_curve] == [p.date for p in benchmark.equity_curve]
+        nav = np.array([p.value for p in backtest.equity_curve])
+        active = nav[1:] / nav[:-1] - 1 - net_benchmark
+        tracking = active.std(ddof=1) * np.sqrt(252)
+        assert backtest.metrics.tracking_error == pytest.approx(tracking)
+        assert backtest.metrics.information_ratio == pytest.approx(active.mean() * 252 / tracking)
+        assert backtest.metrics.excess_total_return == pytest.approx(nav[-1] - expected_nav[-1])
+    changed = benchmark_prices.copy()
+    changed.iloc[64:] *= 1.2
+    later = analyze(prices, request, changed)
+    assert later.benchmark.rebalances == benchmark.rebalances
+    assert later.benchmark.equity_curve[:4] == benchmark.equity_curve[:4]
+    assert later.backtests[0].equity_curve == result.backtests[0].equity_curve
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing", "short", "extra", "reverse", "duplicate", "shift", "nat", "string_dates",
+     "nan", "infinite", "zero", "negative", "nonnumeric"],
+)
+def test_benchmark_prices_require_exact_dates_and_finite_positive_values(corruption):
+    prices = synthetic_prices(count=75)
+    benchmark = prices.iloc[:, 0].copy()
+    request = request_for(
+        prices, strategies=[Strategy.BUY_AND_HOLD], benchmark_ticker="SPY",
+        backtest=BacktestConfig(lookback_days=60), monte_carlo_samples=0, frontier_points=0,
+    )
+    if corruption == "missing":
+        benchmark = None
+    elif corruption == "short":
+        benchmark = benchmark.iloc[1:]
+    elif corruption == "extra":
+        benchmark.loc[benchmark.index[-1] + pd.Timedelta(days=1)] = 100
+    elif corruption == "reverse":
+        benchmark = benchmark.iloc[::-1]
+    elif corruption == "duplicate":
+        benchmark.index = pd.DatetimeIndex([benchmark.index[0]] + benchmark.index[:-1].tolist())
+    elif corruption == "shift":
+        benchmark.index += pd.Timedelta(hours=1)
+    elif corruption == "nat":
+        benchmark.index = pd.DatetimeIndex([pd.NaT] + benchmark.index[1:].tolist())
+    elif corruption == "string_dates":
+        benchmark.index = benchmark.index.strftime("%Y-%m-%d")
+    elif corruption == "nonnumeric":
+        benchmark = benchmark.astype(object)
+        benchmark.iloc[5] = "not a number"
+    else:
+        invalid_values = {"nan": np.nan, "infinite": np.inf, "zero": 0, "negative": -1}
+        benchmark.iloc[5] = invalid_values[corruption]
+    with pytest.raises(PortfolioError, match="[Bb]enchmark") as error:
+        analyze(prices, request, benchmark)
+    assert error.value.code == "invalid_benchmark"
+
+
+def test_benchmark_is_optional_and_can_be_a_portfolio_ticker():
+    prices = prices_from_returns(np.zeros((70, 2)))
+    options = dict(
+        strategies=[Strategy.BUY_AND_HOLD], monte_carlo_samples=0, frontier_points=0,
+        backtest=BacktestConfig(lookback_days=60, transaction_cost_bps=0),
+    )
+    result = analyze(prices, request_for(prices, **options))
+    assert result.benchmark is None
+    assert result.backtests[0].metrics.tracking_error is None
+    assert result.backtests[0].metrics.information_ratio is None
+    assert result.backtests[0].metrics.excess_total_return is None
+    request = request_for(prices, benchmark_ticker="A0", **options)
+    same = analyze(prices, request, prices["A0"])
+    assert same.benchmark.ticker == "A0"
+    assert same.backtests[0].metrics.tracking_error == 0
+    assert same.backtests[0].metrics.information_ratio is None
+    assert same.backtests[0].metrics.excess_total_return == 0
+
+
+def test_relative_metrics_reject_misaligned_equity_dates():
+    equity = equity_from_values([1, 0.99, 1.01], pd.date_range("2020-01-01", periods=3))
+    shifted = equity_from_values([1, 0.99, 1.01], pd.date_range("2020-01-02", periods=3))
+    with pytest.raises(PortfolioError, match="dates must match"):
+        _backtest_metrics(equity, [], 0, shifted)
+
+
+def scenario_request(prices, horizon_days=42, block_days=5, paths=200, **kwargs):
+    """Build a request with scenarios enabled and small path counts."""
+    from portfolio_backend.models import ScenarioConfig
+    options = dict(
+        monte_carlo_samples=0,
+        frontier_points=0,
+        scenario=ScenarioConfig(
+            enabled=True, horizon_days=horizon_days, block_days=block_days,
+            paths=paths,
+        ),
+    )
+    options.update(kwargs)
+    return request_for(prices, **options)
+
+
+def test_scenarios_disabled_by_default():
+    result = analyze(synthetic_prices(), request_for(synthetic_prices()))
+    assert result.scenarios is None
+
+
+def test_scenarios_are_seeded_and_ordered():
+    prices = synthetic_prices(count=120)
+    request = scenario_request(prices)
+    first = analyze(prices, request)
+    second = analyze(prices, request)
+    assert first.scenarios is not None and len(first.scenarios) == len(request.strategies)
+    for one, two in zip(first.scenarios, second.scenarios, strict=True):
+        assert one.fan_paths == two.fan_paths
+        assert one.percentiles == two.percentiles
+    for scenario in first.scenarios:
+        assert len(scenario.fan_paths) == 5
+        for path in scenario.fan_paths:
+            assert len(path.dates) == len(path.values) == 42
+        low = scenario.percentiles[0.05]
+        mid = scenario.percentiles[0.5]
+        high = scenario.percentiles[0.95]
+        assert low.terminal_return <= mid.terminal_return <= high.terminal_return
+        assert low.terminal_wealth <= mid.terminal_wealth <= high.terminal_wealth
+        stats = scenario.summary_statistics
+        assert stats.terminal_return_5pct <= stats.terminal_return_95pct
+        assert stats.max_drawdown_worst_5pct <= 0
+        assert stats.terminal_wealth_mean > 0
+    assert any("scenario" in warning.lower() or "bootstrap" in warning.lower()
+               for warning in first.warnings)
+
+
+def test_scenario_dates_follow_last_observation():
+    prices = synthetic_prices(count=80)
+    result = analyze(prices, scenario_request(prices, horizon_days=30))
+    for scenario in result.scenarios:
+        first_date = pd.Timestamp(scenario.fan_paths[0].dates[0])
+        last_date = pd.Timestamp(scenario.fan_paths[0].dates[-1])
+        assert first_date == prices.index[-1] + pd.Timedelta(days=1)
+        assert last_date == prices.index[-1] + pd.Timedelta(days=30)
+
+
+def test_scenarios_on_flat_prices_stay_at_one():
+    prices = prices_from_returns(np.zeros((70, 2)))
+    result = analyze(prices, scenario_request(prices))
+    for scenario in result.scenarios:
+        for path in scenario.fan_paths:
+            assert path.values == pytest.approx([1.0] * 42)
+        assert scenario.summary_statistics.terminal_wealth_mean == pytest.approx(1)
+
+
+def test_scenario_block_days_require_history():
+    from portfolio_backend.models import ScenarioConfig
+    prices = synthetic_prices(count=61)
+    request = request_for(
+        prices,
+        scenario=ScenarioConfig(enabled=True, block_days=63, horizon_days=21),
+    )
+    with pytest.raises(PortfolioError, match="[Ss]cenario") as error:
+        analyze(prices, request)
+    assert error.value.code == "insufficient_history"
+
+
+def test_scenario_weights_match_fitted_allocations():
+    prices = synthetic_prices(count=90)
+    request = scenario_request(
+        prices, strategies=[Strategy.EQUAL_WEIGHT, Strategy.INVERSE_VOLATILITY],
+    )
+    result = analyze(prices, request)
+    weights_by_strategy = {p.strategy: p.weights for p in result.portfolios}
+    for scenario in result.scenarios:
+        assert scenario.weights == weights_by_strategy[scenario.strategy]
+
+
+def test_scenario_percentile_validation():
+    from portfolio_backend.models import ScenarioConfig
+    with pytest.raises(ValidationError):
+        ScenarioConfig(percentile_levels=[1.5])
+    config = ScenarioConfig(percentile_levels=[0.9, 0.1, 0.1])
+    assert config.percentile_levels == [0.1, 0.9]

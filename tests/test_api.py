@@ -75,6 +75,88 @@ def payload():
     }
 
 
+@pytest.mark.parametrize("benchmark", [" spy ", "AAA"])
+def test_benchmark_roundtrip_separate_snapshots(client, payload, provider, benchmark):
+    import hashlib
+    import json
+
+    response = client.post("/api/v1/analyses", json=payload | {
+        "benchmark_ticker": benchmark,
+        "strategies": ["equal_weight", "buy_and_hold",
+                       "inverse_volatility", "equal_risk_contribution"],
+    })
+    assert response.status_code == 201, response.text
+    saved = response.json()
+    symbol = benchmark.strip().upper()
+    assert saved["request"]["benchmark_ticker"] == symbol
+    assert saved["results"]["benchmark"]["ticker"] == symbol
+    assert len(saved["results"]["backtests"]) == 4
+    base = f"/api/v1/analyses/{saved['id']}"
+    assert client.get(base).json() == saved
+    snapshot = client.get(f"{base}/prices").json()
+    benchmark_snapshot = saved["benchmark_snapshot"]
+    assert snapshot["tickers"] == ["AAA", "BBB", "CCC"]
+    assert benchmark_snapshot["tickers"] == [symbol]
+    assert benchmark_snapshot["dates"] == snapshot["dates"]
+    assert all(len(row) == 1 for row in benchmark_snapshot["prices"])
+    assert [i["symbol"] for i in saved["data"]["instruments"]] == snapshot["tickers"]
+    assert [i["symbol"] for i in saved["benchmark_data"]["instruments"]] == [symbol]
+    for prices, provenance in [(snapshot, saved["data"]),
+                               (benchmark_snapshot, saved["benchmark_data"])]:
+        canonical = json.dumps(
+            prices, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+        assert hashlib.sha256(canonical).hexdigest() == provenance["snapshot_sha256"]
+    benchmark_result = saved["results"]["benchmark"]
+    assert len(benchmark_result["rebalances"]) == 1
+    for backtest in saved["results"]["backtests"]:
+        portfolio_dates = [p["date"] for p in backtest["equity_curve"]]
+        assert portfolio_dates == [p["date"] for p in benchmark_result["equity_curve"]]
+        assert backtest["metrics"]["excess_total_return"] == pytest.approx(
+            backtest["metrics"]["total_return"] - benchmark_result["metrics"]["total_return"]
+        )
+    assert provider.calls == 1
+
+
+@pytest.mark.parametrize("patch", [
+    {"benchmark_ticker": "../SPY"},
+    {"benchmark_ticker": ""},
+    {"benchmark_ticker": "SPY", "backtest": {"enabled": False}},
+])
+def test_invalid_benchmark_never_fetches(client, payload, provider, patch):
+    assert client.post("/api/v1/analyses", json=payload | patch).status_code == 422
+    assert provider.calls == 0
+
+
+def test_benchmark_common_dates_and_insufficient_history(settings, payload):
+    class ShortBenchmarkProvider(FakeProvider):
+        def history(self, tickers, start, end, base_currency):
+            assert tickers == ["AAA", "BBB", "CCC", "SPY"]
+            dataset = super().history(tickers, start, end, base_currency)
+            dataset.prices = dataset.prices.iloc[100:]
+            return dataset
+
+    provider = ShortBenchmarkProvider()
+    with TestClient(create_app(settings=settings, provider=provider)) as client:
+        response = client.post("/api/v1/analyses", json=payload | {
+            "benchmark_ticker": "SPY", "strategies": ["equal_weight"],
+        })
+        assert response.status_code == 201, response.text
+        saved = response.json()
+        assert saved["data"]["effective_start"] == saved["benchmark_data"]["effective_start"]
+        assert saved["data"]["effective_start"] > payload["start_date"]
+        assert any(
+        "benchmark" in warning.lower() and "common" in warning.lower()
+        for warning in saved["results"]["warnings"]
+    )
+        response = client.post("/api/v1/analyses", json=payload | {
+            "benchmark_ticker": "SPY", "backtest": {"lookback_days": 1260},
+        })
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "insufficient_history"
+        assert len(client.get("/api/v1/analyses").json()) == 1
+
+
 def test_health_and_openapi(client):
     """Health reports the expected version, and schema and interactive docs expose the API."""
     assert client.get("/health").json() == {"status": "ok", "version": "0.1.0"}
@@ -214,7 +296,9 @@ def test_empty_api_key_is_invalid_configuration():
         Settings(api_key="", _env_file=None)
 
 
-def test_failed_storage_does_not_leak_details_or_hold_capacity(settings, provider, payload, monkeypatch):
+def test_failed_storage_does_not_leak_details_or_hold_capacity(
+    settings, provider, payload, monkeypatch
+):
     from sqlalchemy.exc import SQLAlchemyError
 
     from portfolio_backend.database import AnalysisRepository

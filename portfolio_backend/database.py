@@ -1,12 +1,20 @@
-from datetime import date, datetime
+import builtins
+from datetime import UTC, date, datetime
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import JSON, Date, DateTime, String, create_engine, select
-from sqlalchemy.engine import make_url
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, String, create_engine, select
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from sqlalchemy.pool import StaticPool
 
-from portfolio_backend.models import AnalysisResponse, AnalysisSummary
+from portfolio_backend.models import (
+    AnalysisResponse,
+    AnalysisSummary,
+    ChatMessage,
+    ConversationDetail,
+    ConversationSummary,
+)
 
 
 class Base(DeclarativeBase):
@@ -32,6 +40,36 @@ class AnalysisRecord(Base):
     end_date: Mapped[date] = mapped_column(Date)
     result: Mapped[dict[str, Any]] = mapped_column(JSON)
     price_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class ConversationRecord(Base):
+    """Map one assistant conversation, optionally linked to a saved analysis.
+
+    The analysis link is informational: deleting analyses is unsupported, so no
+    foreign key is declared and legacy or missing analyses do not break reads.
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    analysis_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+
+class ConversationMessageRecord(Base):
+    """Map one user or assistant turn stored as provider-shaped content blocks."""
+
+    __tablename__ = "conversation_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("conversations.id"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
 
 
 class AnalysisRepository:
@@ -153,3 +191,117 @@ class AnalysisRepository:
                 AnalysisSummary.model_validate(dict(row))
                 for row in session.execute(statement).mappings()
             ]
+
+
+def _utc(value: datetime) -> datetime:
+    """Attach UTC to naive timestamps that SQLite returns without a zone."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+class ConversationRepository:
+    """Persist assistant conversations and messages through a shared engine.
+
+    The engine's owner is responsible for schema creation and disposal; this
+    class only reads and writes. Like analyses, conversations are shared by all
+    authorized callers and carry no owner field.
+    """
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+
+    @staticmethod
+    def _summary(record: ConversationRecord) -> ConversationSummary:
+        return ConversationSummary(
+            id=record.id,
+            analysis_id=record.analysis_id,
+            title=record.title,
+            created_at=_utc(record.created_at),
+            updated_at=_utc(record.updated_at),
+        )
+
+    def create(self, analysis_id: str | None) -> ConversationDetail:
+        now = datetime.now(UTC)
+        record = ConversationRecord(
+            id=str(uuid4()), created_at=now, updated_at=now, analysis_id=analysis_id, title=None
+        )
+        with Session(self.engine) as session, session.begin():
+            session.add(record)
+            session.flush()
+            summary = self._summary(record)
+        return ConversationDetail(**summary.model_dump(), messages=[])
+
+    def get(self, conversation_id: str) -> ConversationDetail | None:
+        with Session(self.engine) as session:
+            record = session.get(ConversationRecord, conversation_id)
+            if record is None:
+                return None
+            rows = session.scalars(
+                select(ConversationMessageRecord)
+                .where(ConversationMessageRecord.conversation_id == conversation_id)
+                .order_by(ConversationMessageRecord.id)
+            ).all()
+            return ConversationDetail(
+                **self._summary(record).model_dump(),
+                messages=[
+                    ChatMessage(
+                        id=row.id, role=row.role, content=row.content,
+                        created_at=_utc(row.created_at),
+                    )
+                    for row in rows
+                ],
+            )
+
+    def list(self, analysis_id: str | None, limit: int) -> list[ConversationSummary]:
+        statement = select(ConversationRecord)
+        if analysis_id is not None:
+            statement = statement.where(ConversationRecord.analysis_id == analysis_id)
+        statement = statement.order_by(
+            ConversationRecord.updated_at.desc(), ConversationRecord.id.desc()
+        ).limit(limit)
+        with Session(self.engine) as session:
+            return [self._summary(record) for record in session.scalars(statement)]
+
+    def append_messages(
+        self, conversation_id: str, messages: "builtins.list[tuple[str, builtins.list[dict]]]"
+    ) -> "builtins.list[int]":
+        """Append (role, content) pairs in order, set a title from the first user message.
+
+        Returns:
+            The new message IDs in insertion order.
+
+        Raises:
+            LookupError: If the conversation does not exist.
+        """
+        now = datetime.now(UTC)
+        with Session(self.engine) as session, session.begin():
+            record = session.get(ConversationRecord, conversation_id)
+            if record is None:
+                raise LookupError(conversation_id)
+            rows = [
+                ConversationMessageRecord(
+                    conversation_id=conversation_id, created_at=now, role=role, content=content
+                )
+                for role, content in messages
+            ]
+            session.add_all(rows)
+            if record.title is None:
+                for role, content in messages:
+                    text = next(
+                        (b.get("text", "") for b in content if b.get("type") == "text"), ""
+                    )
+                    if role == "user" and text.strip():
+                        record.title = text.strip()[:117] + ("..." if len(text.strip()) > 117
+                                                              else "")
+                        break
+            record.updated_at = now
+            session.flush()
+            return [row.id for row in rows]
+
+    def link_analysis(self, conversation_id: str, analysis_id: str) -> bool:
+        """Attach an analysis to a conversation that has none; return whether it changed."""
+        with Session(self.engine) as session, session.begin():
+            record = session.get(ConversationRecord, conversation_id)
+            if record is None or record.analysis_id is not None:
+                return False
+            record.analysis_id = analysis_id
+            return True

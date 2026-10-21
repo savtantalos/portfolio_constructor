@@ -51,8 +51,10 @@ export default function TickerSearch({ selected, onChange, max = 30 }: Props) {
   };
 
   return (
-    <div className="ticker-search">
-      <label className="form-label">Tickers ({selected.length}/{max})</label>
+    <div className="ticker-search"
+      onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false); }}
+      onKeyDown={(e) => { if (e.key === 'Escape') setOpen(false); }}>
+      <label htmlFor="ticker-search" className="form-label">Tickers ({selected.length}/{max})</label>
       <div className="ticker-tags">
         {selected.map((t) => (
           <span key={t} className="ticker-tag">
@@ -63,11 +65,12 @@ export default function TickerSearch({ selected, onChange, max = 30 }: Props) {
       </div>
       <div className="search-input-wrap">
         <input
+          id="ticker-search"
           type="text"
           value={query}
           onChange={(e) => handleInput(e.target.value)}
           onFocus={() => results.length > 0 && setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 200)}
+          autoComplete="off"
           placeholder={selected.length >= max ? 'Maximum reached' : 'Search for stocks or ETFs...'}
           disabled={selected.length >= max}
           className="form-input"
@@ -78,13 +81,15 @@ export default function TickerSearch({ selected, onChange, max = 30 }: Props) {
       {open && results.length > 0 && (
         <ul className="search-dropdown">
           {results.map((item) => (
-            <li key={item.symbol} onMouseDown={() => addTicker(item.symbol)} className="search-item">
-              <strong>{item.symbol}</strong>
-              <span className="search-meta">
-                {item.name && <span>{item.name}</span>}
-                {item.exchange && <span className="search-exchange">{item.exchange}</span>}
-                {item.instrument_type && <span className="search-type">{item.instrument_type}</span>}
-              </span>
+            <li key={item.symbol}>
+              <button type="button" onClick={() => addTicker(item.symbol)} className="search-item" aria-label={`Add ${item.symbol}${item.name ? `, ${item.name}` : ''}`}>
+                <strong>{item.symbol}</strong>
+                <span className="search-meta">
+                  {item.name && <span>{item.name}</span>}
+                  {item.exchange && <span className="search-exchange">{item.exchange}</span>}
+                  {item.instrument_type && <span className="search-type">{item.instrument_type}</span>}
+                </span>
+              </button>
             </li>
           ))}
         </ul>

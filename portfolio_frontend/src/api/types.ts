@@ -1,6 +1,7 @@
 // TypeScript types mirroring portfolio_backend/models.py
 
-export type Strategy = 'equal_weight' | 'minimum_variance' | 'maximum_sharpe';
+export type Strategy = 'equal_weight' | 'minimum_variance' | 'maximum_sharpe'
+  | 'buy_and_hold' | 'inverse_volatility' | 'equal_risk_contribution';
 
 export interface BacktestConfig {
   enabled: boolean;
@@ -9,18 +10,29 @@ export interface BacktestConfig {
   transaction_cost_bps: number;
 }
 
+export interface ScenarioConfig {
+  enabled: boolean;
+  horizon_days: number;
+  block_days: number;
+  paths: number;
+  percentile_levels: number[];
+  random_seed?: number | null;
+}
+
 export interface AnalysisRequest {
   tickers: string[];
   start_date: string;
   end_date: string;
   base_currency: string;
   strategies: Strategy[];
+  benchmark_ticker?: string | null;
   min_weight: number;
   max_weight: number;
   risk_free_rate: number;
   monte_carlo_samples: number;
   frontier_points: number;
   random_seed: number;
+  scenario?: ScenarioConfig;
   backtest: BacktestConfig;
 }
 
@@ -69,6 +81,12 @@ export interface BacktestMetrics {
   max_drawdown: number;
   total_turnover: number;
   total_transaction_cost: number;
+  sortino_ratio?: number | null;
+  calmar_ratio?: number | null;
+  max_drawdown_duration_days?: number | null;
+  tracking_error?: number | null;
+  information_ratio?: number | null;
+  excess_total_return?: number | null;
 }
 
 export interface BacktestResult {
@@ -76,6 +94,42 @@ export interface BacktestResult {
   metrics: BacktestMetrics;
   equity_curve: EquityPoint[];
   rebalances: RebalanceEvent[];
+}
+
+export interface BenchmarkResult {
+  ticker: string;
+  metrics: BacktestMetrics;
+  equity_curve: EquityPoint[];
+  rebalances: RebalanceEvent[];
+}
+
+export interface ScenarioPercentileMetrics {
+  terminal_return: number;
+  max_drawdown: number;
+  terminal_wealth: number;
+  cagr: number | null;
+}
+
+export interface ScenarioFanPath {
+  percentile: number;
+  dates: string[];
+  values: number[];
+}
+
+export interface ScenarioSummaryStatistics {
+  terminal_wealth_mean: number;
+  terminal_wealth_median: number;
+  max_drawdown_worst_5pct: number;
+  terminal_return_5pct: number;
+  terminal_return_95pct: number;
+}
+
+export interface ScenarioResult {
+  strategy: Strategy;
+  weights: Record<string, number>;
+  percentiles: Record<string, ScenarioPercentileMetrics>;
+  fan_paths: ScenarioFanPath[];
+  summary_statistics: ScenarioSummaryStatistics;
 }
 
 export interface EstimationSnapshot {
@@ -94,6 +148,8 @@ export interface AnalyticsResult {
   efficient_frontier: PortfolioPoint[];
   correlation: Record<string, Record<string, number | null>>;
   backtests: BacktestResult[];
+  benchmark?: BenchmarkResult | null;
+  scenarios?: ScenarioResult[] | null;
   warnings: string[];
 }
 
@@ -163,3 +219,73 @@ export interface HealthResponse {
   status: 'ok';
   version: string;
 }
+
+export interface AssistantStatus {
+  enabled: boolean;
+  model: string;
+}
+
+export interface TextBlock {
+  type: 'text';
+  text: string;
+}
+
+export interface ToolUseBlock {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export interface ToolResultBlock {
+  type: 'tool_result';
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+}
+
+export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock;
+
+export interface ChatMessage {
+  id: number;
+  role: 'user' | 'assistant';
+  content: ContentBlock[];
+  created_at: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  analysis_id: string | null;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: ChatMessage[];
+}
+
+export interface ChatContext {
+  analysis_id?: string | null;
+  path?: string | null;
+}
+
+export interface ChatSendRequest {
+  content: string;
+  context?: ChatContext;
+}
+
+export type ToolResultSummary = Record<string, unknown> & {
+  message?: string;
+  analysis_id?: string;
+  link?: string;
+};
+
+export type AssistantEvent =
+  | { type: 'start'; conversation_id: string; user_message_id: number }
+  | { type: 'text_delta'; text: string }
+  | { type: 'tool_call'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; id: string; name: string; ok: boolean; summary: ToolResultSummary }
+  | { type: 'conversation_linked'; analysis_id: string }
+  | { type: 'message_end'; message_ids: number[] }
+  | { type: 'error'; code: string; message: string };

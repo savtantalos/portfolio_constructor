@@ -11,12 +11,17 @@ from .models import (
     AnalyticsResult,
     BacktestMetrics,
     BacktestResult,
+    BenchmarkResult,
     EquityPoint,
     EstimationSnapshot,
     PortfolioPoint,
     PortfolioResult,
     RebalanceEvent,
     RiskMetrics,
+    ScenarioFanPath,
+    ScenarioPercentileMetrics,
+    ScenarioResult,
+    ScenarioSummaryStatistics,
     Strategy,
 )
 
@@ -79,6 +84,12 @@ def _validate(prices: pd.DataFrame, request: AnalysisRequest) -> np.ndarray:
             f"{request.backtest.lookback_days + 3} price observations: lookback returns, "
             "one execution-lag "
             "observation, and at least one subsequent realized return.",
+        )
+    if request.scenario.enabled and len(prices) < request.scenario.block_days + 2:
+        raise PortfolioError(
+            "insufficient_history",
+            f"Scenarios with block_days={request.scenario.block_days} require at least "
+            f"{request.scenario.block_days + 2} price observations.",
         )
     return returns
 
@@ -263,6 +274,69 @@ def _minimum_variance(
     return weights
 
 
+def _inverse_volatility(
+    covariance: np.ndarray, lower: np.ndarray, upper: np.ndarray
+) -> np.ndarray:
+    count = len(lower)
+    volatility = np.sqrt(np.maximum(np.diag(covariance), 0))
+    if volatility.max() <= 1e-12 or min(1 - lower.sum(), upper.sum() - 1) <= 1e-12:
+        return np.full(count, 1 / count)
+    scores = 1 / np.maximum(volatility / volatility.max(), 1e-12)
+    scores /= scores.max()
+    scale = brentq(
+        lambda value: np.clip(value * scores, lower, upper).sum() - 1,
+        0,
+        float(np.max(upper / scores)),
+        xtol=1e-14,
+    )
+    weights = np.clip(scale * scores, lower, upper)
+    if not _valid_weights(weights, lower, upper):
+        raise PortfolioError(
+            "optimization_failed", "Inverse volatility returned an infeasible portfolio."
+        )
+    return weights
+
+
+def _equal_risk_contribution(
+    covariance: np.ndarray, lower: np.ndarray, upper: np.ndarray
+) -> np.ndarray:
+    count = len(lower)
+    equal = np.full(count, 1 / count)
+    scale = float(np.max(np.abs(covariance)))
+    if scale <= 1e-24 or min(1 - lower.sum(), upper.sum() - 1) <= 1e-12:
+        return equal
+    scaled = covariance / scale
+    equal_variance = float(equal @ scaled @ equal)
+    if equal_variance <= 1e-14:
+        return equal
+    scaled /= equal_variance
+
+    def objective(weights):
+        contributions = weights * (scaled @ weights)
+        differences = contributions - contributions.mean()
+        return float(differences @ differences)
+
+    def gradient(weights):
+        marginal = scaled @ weights
+        contributions = weights * marginal
+        jacobian = np.diag(marginal) + weights[:, None] * scaled
+        return 2 * jacobian.T @ (contributions - contributions.mean())
+
+    weights = _solve(
+        objective,
+        gradient,
+        _inverse_volatility(covariance, lower, upper),
+        list(zip(lower, upper, strict=False)),
+        [{"type": "eq", "fun": lambda w: w.sum() - 1, "jac": lambda w: np.ones(count)}],
+        "Equal risk contribution",
+    )
+    if not _valid_weights(weights, lower, upper):
+        raise PortfolioError(
+            "optimization_failed", "Equal risk contribution returned an infeasible portfolio."
+        )
+    return weights
+
+
 def _weights(
     strategy: Strategy, mu: np.ndarray, covariance: np.ndarray, request: AnalysisRequest
 ) -> np.ndarray:
@@ -288,8 +362,12 @@ def _weights(
     equal = np.full(count, 1 / count)
     lower = np.full(count, request.min_weight, dtype=float)
     upper = np.full(count, request.max_weight, dtype=float)
-    if strategy == Strategy.EQUAL_WEIGHT:
+    if strategy in (Strategy.EQUAL_WEIGHT, Strategy.BUY_AND_HOLD):
         return equal
+    if strategy == Strategy.INVERSE_VOLATILITY:
+        return _inverse_volatility(covariance, lower, upper)
+    if strategy == Strategy.EQUAL_RISK_CONTRIBUTION:
+        return _equal_risk_contribution(covariance, lower, upper)
     if strategy == Strategy.MINIMUM_VARIANCE:
         return _minimum_variance(covariance, lower, upper, equal)
     excess = mu - request.risk_free_rate
@@ -473,11 +551,109 @@ def _post_fee_wealth(holdings: np.ndarray, target: np.ndarray, fee_rate: float) 
     return float(after)
 
 
+def _backtest_metrics(
+    equity: list[EquityPoint],
+    events: list[RebalanceEvent],
+    risk_free_rate: float,
+    benchmark_equity: list[EquityPoint] | None = None,
+) -> BacktestMetrics:
+    values = np.asarray([point.value for point in equity])
+    net_returns = values[1:] / values[:-1] - 1
+    volatility = float(np.std(net_returns, ddof=1) * np.sqrt(252))
+    excess = net_returns - risk_free_rate / 252
+    annual_excess = float(excess.mean() * 252)
+    downside = float(np.sqrt(np.mean(np.minimum(excess, 0) ** 2) * 252))
+    elapsed = (equity[-1].date - equity[0].date).days
+    with np.errstate(over="ignore", invalid="ignore"):
+        cagr = float(np.expm1(np.log(values[-1] / values[0]) * 365.25 / elapsed))
+    if not np.isfinite(cagr):
+        raise PortfolioError("backtest_failed", "Backtest CAGR became nonfinite.")
+    drawdown = min(point.drawdown for point in equity)
+    peak, peak_date = equity[0].value, equity[0].date
+    duration = 0
+    underwater = False
+    for point in equity[1:]:
+        if point.value < peak:
+            underwater = True
+            duration = max(duration, (point.date - peak_date).days)
+        else:
+            if underwater:
+                duration = max(duration, (point.date - peak_date).days)
+            peak, peak_date = point.value, point.date
+            underwater = False
+    total_return = float(values[-1] / values[0] - 1)
+    tracking_error = information_ratio = excess_total_return = None
+    if benchmark_equity is not None:
+        if [point.date for point in equity] != [point.date for point in benchmark_equity]:
+            raise PortfolioError(
+                "invalid_benchmark", "Benchmark equity dates must match portfolio dates exactly."
+            )
+        benchmark_values = np.asarray([point.value for point in benchmark_equity])
+        active = net_returns - (benchmark_values[1:] / benchmark_values[:-1] - 1)
+        tracking_error = float(np.std(active, ddof=1) * np.sqrt(252))
+        if tracking_error > 1e-12:
+            information_ratio = float(active.mean() * 252 / tracking_error)
+        excess_total_return = total_return - float(benchmark_values[-1] / benchmark_values[0] - 1)
+    return BacktestMetrics(
+        total_return=total_return,
+        cagr=cagr,
+        annual_volatility=volatility,
+        sharpe_ratio=annual_excess / volatility if volatility > 1e-12 else None,
+        sortino_ratio=annual_excess / downside if downside > 1e-12 else None,
+        calmar_ratio=cagr / abs(drawdown) if abs(drawdown) > 1e-12 else None,
+        max_drawdown=drawdown,
+        max_drawdown_duration_days=duration,
+        total_turnover=sum(event.turnover for event in events),
+        total_transaction_cost=sum(event.transaction_cost for event in events),
+        tracking_error=tracking_error,
+        information_ratio=information_ratio,
+        excess_total_return=excess_total_return,
+    )
+
+
+def _validate_benchmark(
+    benchmark_prices: pd.Series | None, dates: pd.DatetimeIndex
+) -> np.ndarray:
+    if benchmark_prices is None:
+        raise PortfolioError("invalid_benchmark", "Requested benchmark prices are missing.")
+    if (
+        not isinstance(benchmark_prices, pd.Series)
+        or not isinstance(benchmark_prices.index, pd.DatetimeIndex)
+        or benchmark_prices.index.hasnans
+        or not benchmark_prices.index.is_unique
+        or not benchmark_prices.index.is_monotonic_increasing
+        or not benchmark_prices.index.normalize().is_unique
+        or not benchmark_prices.index.equals(dates)
+    ):
+        raise PortfolioError(
+            "invalid_benchmark",
+            "Benchmark prices must have unique increasing daily dates matching portfolio dates "
+            "exactly, without missing or extra observations.",
+        )
+    try:
+        values = benchmark_prices.to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise PortfolioError("invalid_benchmark", "Benchmark prices must be numeric.") from exc
+    if not np.isfinite(values).all() or (values <= 0).any():
+        raise PortfolioError(
+            "invalid_benchmark", "Benchmark prices must be finite and strictly positive."
+        )
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        returns = values[1:] / values[:-1] - 1
+    if not np.isfinite(returns).all():
+        raise PortfolioError(
+            "invalid_benchmark", "Benchmark price ratios must produce finite arithmetic returns."
+        )
+    return returns[:, None]
+
+
 def _backtest(
     returns: np.ndarray,
     dates: pd.DatetimeIndex,
     strategy: Strategy,
     request: AnalysisRequest,
+    tickers: list[str] | None = None,
+    benchmark_equity: list[EquityPoint] | None = None,
 ) -> BacktestResult:
     """Simulate rolling allocations with lagged close execution and trading fees.
 
@@ -510,18 +686,23 @@ def _backtest(
     config = request.backtest
     first = config.lookback_days + 1
     fee_rate = config.transaction_cost_bps / 10000
-    holdings = np.zeros(len(request.tickers))
-    values = [1.0]
+    tickers = request.tickers if tickers is None else tickers
+    holdings = np.zeros(len(tickers))
     equity = [EquityPoint(date=dates[first - 1].date(), value=1, drawdown=0)]
     events = []
     peak = 1.0
     for index in range(first, len(dates)):
         if index > first:
             holdings *= 1 + returns[index - 1]
-        if (index - first) % config.rebalance_every == 0:
-            history = returns[index - config.lookback_days - 1 : index - 1]
-            mu, covariance = _estimate(history)
-            target = _weights(strategy, mu, covariance, request)
+        if index == first or (
+            strategy != Strategy.BUY_AND_HOLD and (index - first) % config.rebalance_every == 0
+        ):
+            if strategy == Strategy.BUY_AND_HOLD:
+                target = np.full(len(tickers), 1 / len(tickers))
+            else:
+                history = returns[index - config.lookback_days - 1 : index - 1]
+                mu, covariance = _estimate(history)
+                target = _weights(strategy, mu, covariance, request)
             if index == first:
                 turnover, cost, after = 1.0, fee_rate, 1 - fee_rate
             else:
@@ -534,7 +715,7 @@ def _backtest(
             events.append(
                 RebalanceEvent(
                     date=dates[index].date(),
-                    weights=dict(zip(request.tickers, target.tolist(), strict=False)),
+                    weights=dict(zip(tickers, target.tolist(), strict=False)),
                     turnover=turnover,
                     transaction_cost=cost,
                 )
@@ -545,37 +726,132 @@ def _backtest(
                 "backtest_failed", "Backtest wealth became nonpositive or nonfinite."
             )
         peak = max(peak, value)
-        values.append(value)
         equity.append(EquityPoint(date=dates[index].date(), value=value, drawdown=value / peak - 1))
-    net_returns = np.asarray(values[1:]) / np.asarray(values[:-1]) - 1
-    standard_deviation = float(np.std(net_returns, ddof=1))
-    volatility = standard_deviation * np.sqrt(252)
-    elapsed = (equity[-1].date - equity[0].date).days
-    with np.errstate(over="ignore", invalid="ignore"):
-        cagr = float(np.expm1(np.log(values[-1]) * 365.25 / elapsed))
-    if not np.isfinite(cagr):
-        raise PortfolioError("backtest_failed", "Backtest CAGR became nonfinite.")
     return BacktestResult(
         strategy=strategy,
-        metrics=BacktestMetrics(
-            total_return=values[-1] - 1,
-            cagr=cagr,
-            annual_volatility=float(volatility),
-            sharpe_ratio=float(
-                (net_returns.mean() - request.risk_free_rate / 252) * 252 / volatility
-            )
-            if volatility > 1e-12
-            else None,
-            max_drawdown=min(point.drawdown for point in equity),
-            total_turnover=sum(event.turnover for event in events),
-            total_transaction_cost=sum(event.transaction_cost for event in events),
-        ),
+        metrics=_backtest_metrics(equity, events, request.risk_free_rate, benchmark_equity),
         equity_curve=equity,
         rebalances=events,
     )
 
 
-def analyze(prices: pd.DataFrame, request: AnalysisRequest) -> AnalyticsResult:
+def _scenarios(
+    returns: np.ndarray,
+    last_date: pd.Timestamp,
+    portfolios: list[PortfolioResult],
+    request: AnalysisRequest,
+) -> list[ScenarioResult] | None:
+    """Resample historical return blocks into conditional forward wealth paths.
+
+    Each path concatenates randomly chosen consecutive daily-return blocks,
+    preserving cross-asset dependence and serial structure within each block.
+    Percentiles are computed across paths per date and at the terminal date.
+    Results are conditional on the fitted weights and the sample return
+    distribution; they are not forecasts.
+
+    Args:
+        returns: Validated decimal daily returns of shape (T - 1, N).
+        last_date: Final price observation date; paths start the next day.
+        portfolios: Fitted strategy allocations providing scenario weights.
+        request: Scenario horizon, block length, path count, percentile
+            levels, and optional dedicated random seed.
+
+    Returns:
+        One ScenarioResult per portfolio, or None when scenarios are
+        disabled or no portfolios exist.
+
+    Raises:
+        PortfolioError: If fewer than block_days returns exist or simulated
+            wealth becomes nonpositive or nonfinite.
+    """
+    config = request.scenario
+    if not config.enabled:
+        return None
+    if not portfolios:
+        return []
+    horizon, n_paths, block = config.horizon_days, config.paths, config.block_days
+    n_returns = returns.shape[0]
+    if n_returns < block:
+        raise PortfolioError(
+            "insufficient_history",
+            f"Scenario simulation requires at least {block} return observations "
+            f"(block_days) but only {n_returns} are available.",
+        )
+    seed = config.random_seed if config.random_seed is not None else request.random_seed
+    rng = np.random.default_rng(seed)
+    n_blocks = -(-horizon // block)
+    starts = rng.integers(0, n_returns - block + 1, size=(n_paths, n_blocks))
+    offsets = np.arange(block)
+    sampled = np.empty((n_paths, n_blocks * block, returns.shape[1]))
+    for index in range(n_blocks):
+        sampled[:, index * block:(index + 1) * block] = returns[
+            starts[:, index, None] + offsets
+        ]
+    sampled = sampled[:, :horizon]
+    if not np.isfinite(sampled).all():
+        raise PortfolioError("scenario_failed", "Scenario returns became nonfinite.")
+    dates = [
+        (last_date + pd.Timedelta(days=step + 1)).date().isoformat()
+        for step in range(horizon)
+    ]
+    elapsed_years = horizon / 365.25
+    results = []
+    for portfolio in portfolios:
+        weights = np.asarray([portfolio.weights[ticker] for ticker in request.tickers])
+        wealth = np.cumprod(1 + sampled @ weights, axis=1)
+        if not np.isfinite(wealth).all() or (wealth <= 0).any():
+            raise PortfolioError(
+                "scenario_failed", "Scenario wealth became nonpositive or nonfinite."
+            )
+        full = np.concatenate([np.ones((n_paths, 1)), wealth], axis=1)
+        max_drawdowns = (full / np.maximum.accumulate(full, axis=1) - 1).min(axis=1)
+        terminal_wealth = wealth[:, -1]
+        terminal_return = terminal_wealth - 1
+        cagr_all = np.where(
+            terminal_wealth > 0, terminal_wealth ** (1 / elapsed_years) - 1, np.nan
+        )
+        percentiles = {}
+        for level in config.percentile_levels:
+            q = level * 100
+            cagr_value = np.percentile(cagr_all, q)
+            percentiles[level] = ScenarioPercentileMetrics(
+                terminal_return=float(np.percentile(terminal_return, q)),
+                max_drawdown=float(np.percentile(max_drawdowns, q)),
+                terminal_wealth=float(np.percentile(terminal_wealth, q)),
+                cagr=float(cagr_value) if np.isfinite(cagr_value) else None,
+            )
+        fan_paths = [
+            ScenarioFanPath(
+                percentile=level,
+                dates=dates,
+                values=np.percentile(wealth, level * 100, axis=0).tolist(),
+            )
+            for level in config.percentile_levels
+        ]
+        tail = max(1, int(np.ceil(0.05 * n_paths)))
+        results.append(
+            ScenarioResult(
+                strategy=portfolio.strategy,
+                weights=dict(zip(request.tickers, weights.tolist(), strict=False)),
+                percentiles=percentiles,
+                fan_paths=fan_paths,
+                summary_statistics=ScenarioSummaryStatistics(
+                    terminal_wealth_mean=float(terminal_wealth.mean()),
+                    terminal_wealth_median=float(np.median(terminal_wealth)),
+                    max_drawdown_worst_5pct=float(np.sort(max_drawdowns)[:tail].mean()),
+                    terminal_return_5pct=float(np.percentile(terminal_return, 5)),
+                    terminal_return_95pct=float(np.percentile(terminal_return, 95)),
+                ),
+            )
+        )
+    return results
+
+
+def analyze(
+    prices: pd.DataFrame,
+    request: AnalysisRequest,
+    benchmark_prices: pd.Series | None = None,
+) -> AnalyticsResult:
     """Analyze historical portfolio allocations and optional lagged backtests.
 
     Args:
@@ -600,6 +876,22 @@ def analyze(prices: pd.DataFrame, request: AnalysisRequest) -> AnalyticsResult:
             fails, or a non-omitted optimization/backtest fails.
     """
     returns = _validate(prices, request)
+    benchmark = None
+    if request.benchmark_ticker is not None:
+        benchmark_returns = _validate_benchmark(benchmark_prices, prices.index)
+        simulation = _backtest(
+            benchmark_returns,
+            prices.index,
+            Strategy.BUY_AND_HOLD,
+            request,
+            tickers=[request.benchmark_ticker],
+        )
+        benchmark = BenchmarkResult(
+            ticker=request.benchmark_ticker,
+            metrics=simulation.metrics,
+            equity_curve=simulation.equity_curve,
+            rebalances=simulation.rebalances,
+        )
     mu, covariance = _estimate(returns)
     warnings = [
         "Estimates use arithmetic daily returns, annual arithmetic means and Ledoit-Wolf "
@@ -608,6 +900,23 @@ def analyze(prices: pd.DataFrame, request: AnalysisRequest) -> AnalyticsResult:
         "Historical estimates and the constrained efficient frontier are in-sample estimates, "
         "not forecasts or guaranteed outcomes.",
     ]
+    if Strategy.EQUAL_RISK_CONTRIBUTION in request.strategies:
+        warnings.append(
+            "Equal risk contribution minimizes covariance-aware risk contribution differences; "
+            "weight bounds may prevent equal risk contributions. Zero portfolio variance has "
+            "zero reported risk contributions."
+        )
+    if Strategy.INVERSE_VOLATILITY in request.strategies:
+        warnings.append(
+            "Inverse volatility uses the covariance diagonal and capped proportional weights; "
+            "zero volatilities use a relative floor of 1e-12, and all-zero risk uses equal weights."
+        )
+    if Strategy.BUY_AND_HOLD in request.strategies or benchmark is not None:
+        warnings.append(
+            "Buy-and-hold portfolios and the benchmark enter at the same lagged close with the "
+            "same entry fee, then drift without rebalancing. Buy-and-hold starts equally weighted; "
+            "the single-asset benchmark is not subject to portfolio weight bounds."
+        )
     portfolios = []
     for strategy in request.strategies:
         try:
@@ -650,6 +959,14 @@ def analyze(prices: pd.DataFrame, request: AnalysisRequest) -> AnalyticsResult:
         }
         for ticker in request.tickers
     }
+    scenarios = _scenarios(returns, prices.index[-1], portfolios, request)
+    if scenarios:
+        warnings.append(
+            "Block-bootstrap scenarios resample consecutive historical return blocks with "
+            "replacement, preserving cross-asset dependence within blocks; path dates are "
+            "calendar days. Outcomes are conditional on the fitted weights and the sample "
+            "return distribution, not forecasts or probability predictions."
+        )
     backtests = []
     if request.backtest.enabled:
         warnings.append(
@@ -665,7 +982,15 @@ def analyze(prices: pd.DataFrame, request: AnalysisRequest) -> AnalyticsResult:
         )
         for strategy in request.strategies:
             try:
-                backtests.append(_backtest(returns, prices.index, strategy, request))
+                backtests.append(
+                    _backtest(
+                        returns,
+                        prices.index,
+                        strategy,
+                        request,
+                        benchmark_equity=benchmark.equity_curve if benchmark is not None else None,
+                    )
+                )
             except PortfolioError as exc:
                 if strategy == Strategy.MAXIMUM_SHARPE:
                     warnings.append(
@@ -680,6 +1005,8 @@ def analyze(prices: pd.DataFrame, request: AnalysisRequest) -> AnalyticsResult:
         efficient_frontier=frontier,
         correlation=correlation,
         backtests=backtests,
+        benchmark=benchmark,
+        scenarios=scenarios,
         warnings=warnings,
         estimation=EstimationSnapshot(
             tickers=list(request.tickers),

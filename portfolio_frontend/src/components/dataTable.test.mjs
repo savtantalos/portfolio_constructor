@@ -26,3 +26,15 @@ test('row search handles dates, strategies, numeric values, and null cells witho
   assert.deepEqual(filterDataRows([], 'AAA'), []);
   assert.deepEqual(rows, original);
 });
+
+test('strategy cells use shared readable labels while searches accept labels or stored enum values', () => {
+  const rows = [['buy_and_hold'], ['inverse_volatility'], ['equal_risk_contribution']];
+  assert.equal(formatDataCell('buy_and_hold'), 'Buy & Hold');
+  assert.equal(formatDataCell('inverse_volatility'), 'Inverse Volatility');
+  assert.equal(formatDataCell('equal_risk_contribution'), 'Equal Risk Contribution');
+  assert.deepEqual(filterDataRows(rows, 'buy & hold'), [rows[0]]);
+  assert.deepEqual(filterDataRows(rows, 'inverse_volatility'), [rows[1]]);
+  assert.deepEqual(filterDataRows(rows, 'equal risk'), [rows[2]]);
+  assert.equal(formatDataCell('unknown_strategy'), 'unknown_strategy');
+  assert.equal(formatDataCell('toString'), 'toString');
+});

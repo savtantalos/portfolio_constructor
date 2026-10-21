@@ -111,6 +111,84 @@ def test_new_analyses_persist_exact_optimizer_estimates(export_case, monkeypatch
     assert provider.calls == 1
 
 
+def test_benchmark_exports_preserve_snapshot_metrics_and_no_recomputation(export_case, monkeypatch):
+    client, provider, _, saved, _, _ = export_case
+    response = client.post("/api/v1/analyses", json=saved["request"] | {
+        "benchmark_ticker": "SPY",
+        "strategies": ["buy_and_hold", "inverse_volatility", "equal_risk_contribution"],
+    })
+    assert response.status_code == 201, response.text
+    saved = response.json()
+    base = f"/api/v1/analyses/{saved['id']}"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Benchmark export must use only saved prices and results")
+
+    monkeypatch.setattr(provider, "history", forbidden)
+    monkeypatch.setattr(analytics, "_weights", forbidden)
+    monkeypatch.setattr(analytics, "_estimate", forbidden)
+    monkeypatch.setattr(analytics, "_backtest", forbidden)
+    tables, _ = dataset_map(client, base)
+    benchmark = saved["results"]["benchmark"]
+    assert tables["benchmark_metrics"]["rows"] == [["SPY", *benchmark["metrics"].values()]]
+    assert tables["benchmark_prices"]["rows"] == [
+        [day, *row] for day, row in zip(
+            saved["benchmark_snapshot"]["dates"], saved["benchmark_snapshot"]["prices"], strict=True
+        )
+    ]
+    assert len(tables["benchmark_trades"]["rows"]) == 1
+    assert tables["benchmark_equity"]["rows"][0][-1] is None
+    for index, point in enumerate(benchmark["equity_curve"]):
+        row = tables["benchmark_equity"]["rows"][index]
+        assert row[:4] == ["SPY", point["date"], point["value"], point["drawdown"]]
+        if index:
+            assert row[-1] == point["value"] / benchmark["equity_curve"][index - 1]["value"] - 1
+    with zipfile.ZipFile(io.BytesIO(client.get(f"{base}/export").content)) as archive:
+        assert json.loads(archive.read("analysis.json")) == saved
+        assert json.loads(archive.read("benchmark_prices.json")) == saved["benchmark_snapshot"]
+        assert hashlib.sha256(archive.read("benchmark_prices.json")).hexdigest() == (
+            saved["benchmark_data"]["snapshot_sha256"]
+        )
+        assert hashlib.sha256(archive.read("prices.json")).hexdigest() == (
+            saved["data"]["snapshot_sha256"]
+        )
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["benchmark_provenance"] == saved["benchmark_data"]
+        benchmark_names = [
+            "benchmark_prices", "benchmark_metrics", "benchmark_equity", "benchmark_trades"
+        ]
+        for name in benchmark_names:
+            response = client.get(f"{base}/export/{name}")
+            assert response.status_code == 200
+            assert response.content == archive.read(f"{name}.csv")
+    assert provider.calls == 2
+
+
+def test_legacy_new_metrics_and_benchmark_default_to_null_without_rewrite(export_case):
+    client, _, settings, saved, _, base = export_case
+    saved.pop("benchmark_data", None)
+    saved.pop("benchmark_snapshot", None)
+    saved["request"].pop("benchmark_ticker", None)
+    saved["results"].pop("benchmark", None)
+    new_fields = ["sortino_ratio", "calmar_ratio", "max_drawdown_duration_days",
+                  "tracking_error", "information_ratio", "excess_total_return"]
+    for backtest in saved["results"]["backtests"]:
+        for field in new_fields:
+            backtest["metrics"].pop(field, None)
+    replace_saved(settings, saved)
+    retrieved = client.get(base).json()
+    assert retrieved["results"]["benchmark"] is None
+    assert retrieved["benchmark_snapshot"] is None
+    assert all(retrieved["results"]["backtests"][0]["metrics"][key] is None for key in new_fields)
+    tables, _ = dataset_map(client, base)
+    for key in new_fields:
+        column = tables["backtest_metrics"]["columns"].index(key)
+        assert all(row[column] is None for row in tables["backtest_metrics"]["rows"])
+    with zipfile.ZipFile(io.BytesIO(client.get(f"{base}/export").content)) as archive:
+        assert "benchmark_prices.json" not in archive.namelist()
+        assert json.loads(archive.read("analysis.json")) == saved
+
+
 def test_tables_match_snapshot_sample_and_optimizer_estimators(export_case):
     client, _, _, saved, snapshot, base = export_case
     tables, _ = dataset_map(client, base)
@@ -386,3 +464,44 @@ def test_export_missing_invalid_ids_and_auth(export_case, suffix):
             f"{base}/{suffix}", headers={"X-API-Key": "export-test-key"}
         ).status_code == 200
     assert provider.calls == 1
+
+
+def test_scenario_exports_use_saved_results(export_case, monkeypatch):
+    client, provider, _, saved, _, _ = export_case
+    response = client.post("/api/v1/analyses", json=saved["request"] | {
+        "scenario": {"enabled": True, "horizon_days": 30, "block_days": 5, "paths": 120},
+    })
+    assert response.status_code == 201, response.text
+    saved = response.json()
+    base = f"/api/v1/analyses/{saved['id']}"
+    scenarios = saved["results"]["scenarios"]
+    assert len(scenarios) == len(saved["request"]["strategies"])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Scenario export must use only saved results")
+
+    monkeypatch.setattr(provider, "history", forbidden)
+    monkeypatch.setattr(analytics, "_scenarios", forbidden)
+    tables, _ = dataset_map(client, base)
+    assert len(tables["scenario_summary"]["rows"]) == len(scenarios)
+    for row in tables["scenario_summary"]["rows"]:
+        strategy = row[0]
+        stats = next(s for s in scenarios if s["strategy"] == strategy)["summary_statistics"]
+        assert row[1:] == [
+            stats["terminal_wealth_mean"], stats["terminal_wealth_median"],
+            stats["terminal_return_5pct"], stats["terminal_return_95pct"],
+            stats["max_drawdown_worst_5pct"],
+        ]
+    percentile_rows = tables["scenario_percentiles"]["rows"]
+    assert len(percentile_rows) == sum(len(s["percentiles"]) for s in scenarios)
+    fan_rows = tables["scenario_fan"]["rows"]
+    expected_fan = sum(
+        len(path["dates"]) for s in scenarios for path in s["fan_paths"]
+    )
+    assert len(fan_rows) == expected_fan
+    with zipfile.ZipFile(io.BytesIO(client.get(f"{base}/export").content)) as archive:
+        assert json.loads(archive.read("analysis.json")) == saved
+        for name in ["scenario_summary", "scenario_percentiles", "scenario_fan"]:
+            response = client.get(f"{base}/export/{name}")
+            assert response.status_code == 200
+            assert response.content == archive.read(f"{name}.csv")

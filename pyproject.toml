@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Portfolio optimization, allocation simulation, and walk-forward backtesting API"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic==1.2.0",
     "fastapi==0.115.12",
     "numpy==2.2.6",
     "pandas==2.2.3",

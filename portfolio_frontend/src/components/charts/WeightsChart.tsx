@@ -1,21 +1,16 @@
 import type { PortfolioResult } from '../../api/types';
 import type { ColorTheme } from '../../hooks/useColorTheme';
 import PlotWrapper from './PlotWrapper';
+import { STRATEGY_LABELS } from '../strategyMetadata';
 
 interface Props {
   portfolios: PortfolioResult[];
   theme: ColorTheme;
 }
 
-const STRATEGY_LABELS: Record<string, string> = {
-  equal_weight: 'Equal Weight',
-  minimum_variance: 'Min Variance',
-  maximum_sharpe: 'Max Sharpe',
-};
-
 export default function WeightsChart({ portfolios, theme }: Props) {
   const tickers = portfolios.length > 0 ? Object.keys(portfolios[0].weights) : [];
-  const strategies = portfolios.map((p) => STRATEGY_LABELS[p.strategy] || p.strategy);
+  const strategies = portfolios.map((p) => STRATEGY_LABELS[p.strategy]);
 
   const data: Plotly.Data[] = tickers.map((ticker, i) => ({
     x: strategies,

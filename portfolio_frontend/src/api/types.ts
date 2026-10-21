@@ -219,3 +219,73 @@ export interface HealthResponse {
   status: 'ok';
   version: string;
 }
+
+export interface AssistantStatus {
+  enabled: boolean;
+  model: string;
+}
+
+export interface TextBlock {
+  type: 'text';
+  text: string;
+}
+
+export interface ToolUseBlock {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export interface ToolResultBlock {
+  type: 'tool_result';
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+}
+
+export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock;
+
+export interface ChatMessage {
+  id: number;
+  role: 'user' | 'assistant';
+  content: ContentBlock[];
+  created_at: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  analysis_id: string | null;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: ChatMessage[];
+}
+
+export interface ChatContext {
+  analysis_id?: string | null;
+  path?: string | null;
+}
+
+export interface ChatSendRequest {
+  content: string;
+  context?: ChatContext;
+}
+
+export type ToolResultSummary = Record<string, unknown> & {
+  message?: string;
+  analysis_id?: string;
+  link?: string;
+};
+
+export type AssistantEvent =
+  | { type: 'start'; conversation_id: string; user_message_id: number }
+  | { type: 'text_delta'; text: string }
+  | { type: 'tool_call'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; id: string; name: string; ok: boolean; summary: ToolResultSummary }
+  | { type: 'conversation_linked'; analysis_id: string }
+  | { type: 'message_end'; message_ids: number[] }
+  | { type: 'error'; code: string; message: string };
